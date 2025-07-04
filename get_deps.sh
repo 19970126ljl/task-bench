@@ -72,6 +72,7 @@ export USE_HPX=${USE_HPX:-$DEFAULT_FEATURES}
 export USE_CHAPEL=${USE_CHAPEL:-$DEFAULT_FEATURES}
 export USE_X10=${USE_X10:-$DEFAULT_FEATURES}
 export USE_OPENMP=${USE_OPENMP:-$DEFAULT_FEATURES}
+export USE_CUDASTF=${USE_CUDASTF:-$DEFAULT_FEATURES}
 export USE_OMPSS=${USE_OMPSS:-$DEFAULT_FEATURES}
 export USE_OMPSS2=${USE_OMPSS2:-$DEFAULT_FEATURES}
 export USE_SPARK=${USE_SPARK:-$DEFAULT_FEATURES}
@@ -520,3 +521,24 @@ EOF
     conda update -y conda
     conda install -y dask
 fi)
+
+if [[ $USE_CUDASTF -eq 1 ]]; then
+    export CUDASTF_DIR="$TASKBENCH_DEPS_DIR"/cudastf
+    cat >>deps/env.sh <<EOF
+export CUDASTF_DIR="\$TASKBENCH_DEPS_DIR"/cudastf
+export CCCL_DIR="\$CUDASTF_DIR"/cccl
+
+EOF
+
+    mkdir -p "$CUDASTF_DIR"
+
+    # Check if CCCL already exists in the expected location
+    if [[ ! -d "$TASKBENCH_ROOT_DIR"/cccl ]]; then
+        echo "CCCL not found at $TASKBENCH_ROOT_DIR/cccl"
+        echo "Please ensure CCCL is available for CUDA STF support"
+        echo "You can clone it with: git clone https://github.com/NVIDIA/cccl.git"
+    else
+        # Create symlink to existing CCCL
+        ln -sf "$TASKBENCH_ROOT_DIR"/cccl "$CUDASTF_DIR"/cccl
+    fi
+fi

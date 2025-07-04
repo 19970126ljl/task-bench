@@ -289,6 +289,11 @@ if [[ $USE_OPENMP -eq 1 ]]; then
     make -C openmp -j$THREADS
 fi
 
+if [[ $USE_CUDASTF -eq 1 ]]; then
+    make -C cudastf clean
+    make -C cudastf -j$THREADS
+fi
+
 if [[ $USE_OMPSS -eq 1 ]]; then
     pushd "$NANOS_SRC_DIR"
     if [[ ! -d build ]]; then
