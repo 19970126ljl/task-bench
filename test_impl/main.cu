@@ -114,6 +114,9 @@ __global__ void compute2_kernel(slice<char> output, long iterations) {
 typedef struct tile_s {
   float dep;
   char *output_buff;
+  // constructors for different access patterns
+  tile_s(float dep, char *output_buff) : dep(dep), output_buff(output_buff) {}  // for write access
+  tile_s(float dep, const char *output_buff) : dep(dep), output_buff(const_cast<char*>(output_buff)) {}  // for read access
 }tile_t;
 
 typedef struct payload_s {
@@ -132,6 +135,7 @@ typedef struct matrix_s {
   tile_t *data;
   int M;
   int N;
+  std::vector<logical_data<slice<char, 1>>> handles;
 }matrix_t;
 
 
@@ -158,7 +162,7 @@ char **extra_local_memory;
 CudaSTFApp::CudaSTFApp(int argc, char **argv)
   : App(argc, argv)
 {
-  printf("DEBUG: Initializing CUDA STF App with %zu graphs\n", graphs.size());
+  // printf("DEBUG: Initializing CUDA STF App with %zu graphs\n", graphs.size());
 
   size_t max_scratch_bytes_per_task = 0;
   matrix_t *matrix = mat_array;
@@ -168,16 +172,20 @@ CudaSTFApp::CudaSTFApp(int argc, char **argv)
     matrix[i].M = graph.nb_fields;
     matrix[i].N = graph.max_width;
     matrix[i].data = (tile_t*)malloc(sizeof(tile_t) * matrix[i].M * matrix[i].N);
+
+    matrix[i].handles.resize(matrix[i].M * matrix[i].N);
   
     for (int j = 0; j < matrix[i].M * matrix[i].N; j++) {
       matrix[i].data[j].output_buff = (char *)malloc(sizeof(char) * graph.output_bytes_per_task);
+      // register logical data handles
+      matrix[i].handles[j] = ctx.logical_data(make_slice(matrix[i].data[j].output_buff, graph.output_bytes_per_task));
     }
     
     if (graph.scratch_bytes_per_task > max_scratch_bytes_per_task) {
       max_scratch_bytes_per_task = graph.scratch_bytes_per_task;
     }
     
-    printf("graph id %d, M = %d, N = %d, data %p, nb_fields %d\n", i, matrix[i].M, matrix[i].N, matrix[i].data, graph.nb_fields);
+    // printf("graph id %d, M = %d, N = %d, data %p, nb_fields %d\n", i, matrix[i].M, matrix[i].N, matrix[i].data, graph.nb_fields);
   }
   
   extra_local_memory = (char**)malloc(sizeof(char*) * MAX_WIDTH);
@@ -196,9 +204,8 @@ CudaSTFApp::CudaSTFApp(int argc, char **argv)
 
 // Destructor
 CudaSTFApp::~CudaSTFApp() {
-  // 等待所有任务完成
-  printf("DEBUG: Finalizing CUDA STF context\n");
-  ctx.finalize();
+  // printf("DEBUG: Finalizing CUDA STF context\n");
+  // ctx.finalize();
   matrix_t *matrix = mat_array;
   for (unsigned i = 0; i < graphs.size(); i++) {
     for (int j = 0; j < matrix[i].M * matrix[i].N; j++) {
@@ -221,7 +228,7 @@ CudaSTFApp::~CudaSTFApp() {
   free(extra_local_memory);
   extra_local_memory = NULL;
 
-  printf("DEBUG: CUDA STF cleanup complete\n");
+  // printf("DEBUG: CUDA STF cleanup complete\n");
 }
 
 static inline void task1(tile_t *tile_out, payload_t payload)
@@ -239,10 +246,70 @@ static inline void task1(tile_t *tile_out, payload_t payload)
                       input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
 #else  
   tile_out->dep = 0;
-  printf("Task1, x %d, y %d, out %f\n", payload.x, payload.y, tile_out->dep);
+  printf("Task1 tid %d, x %d, y %d, out %f\n", payload.x, payload.x, payload.y, tile_out->dep);
 #endif  
 }
+static inline void task2(tile_t *tile_out, tile_t *tile_in1, payload_t payload)
+{
+#if defined (USE_CORE_VERIFICATION)    
+  TaskGraph graph = payload.graph;
+  char *output_ptr = (char*)tile_out->output_buff;
+  size_t output_bytes= graph.output_bytes_per_task;
+  std::vector<const char *> input_ptrs;
+  std::vector<size_t> input_bytes;
+  input_ptrs.push_back((char*)tile_in1->output_buff);
+  input_bytes.push_back(graph.output_bytes_per_task);
+  
+  graph.execute_point(payload.y, payload.x, output_ptr, output_bytes,
+                      input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
+#else  
+  tile_out->dep = tile_in1->dep + 1;
+  printf("Task2 tid %d, x %d, y %d, out %f, in1 %f\n", payload.x, payload.x, payload.y, tile_out->dep,tile_in1->dep);
+#endif
+}
+static inline void task3(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, payload_t payload)
+{
+#if defined (USE_CORE_VERIFICATION)    
+  TaskGraph graph = payload.graph;
+  char *output_ptr = (char*)tile_out->output_buff;
+  size_t output_bytes= graph.output_bytes_per_task;
+  std::vector<const char *> input_ptrs;
+  std::vector<size_t> input_bytes;
+  input_ptrs.push_back((char*)tile_in1->output_buff);
+  input_bytes.push_back(graph.output_bytes_per_task);
+  input_ptrs.push_back((char*)tile_in2->output_buff);
+  input_bytes.push_back(graph.output_bytes_per_task);
 
+  graph.execute_point(payload.y, payload.x, output_ptr, output_bytes,
+                     input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
+#else  
+  tile_out->dep = tile_in1->dep + tile_in2->dep + 1;
+  printf("Task3 tid %d, x %d, y %d, out %f, in1 %f, in2 %f\n", payload.x, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep);
+#endif
+}
+static inline void task4(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, payload_t payload)
+{
+#if defined (USE_CORE_VERIFICATION)    
+  TaskGraph graph = payload.graph;
+  char *output_ptr = (char*)tile_out->output_buff;
+  size_t output_bytes= graph.output_bytes_per_task;
+  std::vector<const char *> input_ptrs;
+  std::vector<size_t> input_bytes;
+  input_ptrs.push_back((char*)tile_in1->output_buff);
+  input_bytes.push_back(graph.output_bytes_per_task);
+  input_ptrs.push_back((char*)tile_in2->output_buff);
+  input_bytes.push_back(graph.output_bytes_per_task);
+  input_ptrs.push_back((char*)tile_in3->output_buff);
+  input_bytes.push_back(graph.output_bytes_per_task);
+
+  graph.execute_point(payload.y, payload.x, output_ptr, output_bytes,
+                      input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
+#else
+  tile_out->dep = tile_in1->dep + tile_in2->dep + tile_in3->dep + 1;
+  printf("Task4 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f\n", payload.x, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep);
+#endif
+}
+  
 void CudaSTFApp::execute_main_loop()
 {
   display();
@@ -264,7 +331,7 @@ void CudaSTFApp::execute_main_loop()
 }
 
 void CudaSTFApp::execute_timestep(size_t idx, long t) {
-  printf("Debug: Executing timestep %ld for graph %zu\n", t, idx);
+  // printf("Debug: Executing timestep %ld for graph %zu\n", t, idx);
   const TaskGraph &g = graphs[idx];
   long offset = g.offset_at_timestep(t);
   long width = g.width_at_timestep(t);
@@ -327,29 +394,81 @@ void CudaSTFApp::execute_timestep(size_t idx, long t) {
 }
 
 void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload, size_t graph_id) {
-  // print the arguments
-  for (int i = 0; i < num_args; i++) {
-    printf("arg %d: %d, %d\n", i, args[i].x, args[i].y);
-  }
+  // // print the arguments
+  // for (int i = 0; i < num_args; i++) {
+  //   printf("arg %d: %d, %d\n", i, args[i].x, args[i].y);
+  // }
   matrix_t* matrix = mat_array;
-  tile_t *mat = matrix[graph_id].data;
+  matrix_t* mat = &matrix[graph_id];
+  tile_t *tiles = matrix[graph_id].data;
+  int nb_fields = matrix[graph_id].M;
+  int max_width = matrix[graph_id].N;
   int x0 = args[0].x;
   int y0 = args[0].y;
-//  printf("x %d, y %d, mat %p\n", x0, y0, mat);
   switch(num_args) {
   case 1:
   {
-    // #pragma omp task depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-    logical_data<slice<char>> tile_buffer = ctx.logical_data(mat[y0 * matrix[graph_id].N + x0].output_buff, payload.graph.output_bytes_per_task);
-    tile_buffer.set_symbol("out_buffer");
+    logical_data<slice<char, 1>>& tile_buffer = mat->handles[(y0 % nb_fields) * max_width + x0];
     ctx.task(exec_place::host(), tile_buffer.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile) {
-      task1(&mat[y0 * matrix[graph_id].N + x0], payload);
+      tile_t t(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile.data_handle());
+      task1(&t, payload);
     };
-    // task1(&mat[y0 * matrix[graph_id].N + x0], payload);
+    break;
+  }
+
+  case 2:
+  {
+    int x1 = args[1].x;
+    int y1 = args[1].y;
+    logical_data<slice<char, 1>>& tile_buffer1 = mat->handles[(y1 % nb_fields) * max_width + x1];
+    logical_data<slice<char, 1>>& tile_buffer2 = mat->handles[(y0 % nb_fields) * max_width + x0];
+    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2) {
+      tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
+      tile_t t2(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile2.data_handle());
+      task2(&t2, &t1, payload);
+    };
+    break;
+  }
+  case 3:
+  {
+    int x1 = args[1].x;
+    int y1 = args[1].y;
+    int x2 = args[2].x;
+    int y2 = args[2].y;
+    logical_data<slice<char, 1>>& tile_buffer1 = mat->handles[(y1 % nb_fields) * max_width + x1];
+    logical_data<slice<char, 1>>& tile_buffer2 = mat->handles[(y2 % nb_fields) * max_width + x2];
+    logical_data<slice<char, 1>>& tile_buffer3 = mat->handles[(y0 % nb_fields) * max_width + x0];
+    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3) {
+      tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
+      tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
+      tile_t t3(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile3.data_handle());
+      task3(&t3, &t1, &t2, payload);
+    };
+    break;
+  }
+  case 4:
+  {
+    int x1 = args[1].x;
+    int y1 = args[1].y;
+    int x2 = args[2].x;
+    int y2 = args[2].y;
+    int x3 = args[3].x;
+    int y3 = args[3].y;
+    logical_data<slice<char, 1>>& tile_buffer1 = mat->handles[(y1 % nb_fields) * max_width + x1];
+    logical_data<slice<char, 1>>& tile_buffer2 = mat->handles[(y2 % nb_fields) * max_width + x2];
+    logical_data<slice<char, 1>>& tile_buffer3 = mat->handles[(y3 % nb_fields) * max_width + x3];
+    logical_data<slice<char, 1>>& tile_buffer4 = mat->handles[(y0 % nb_fields) * max_width + x0];
+    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4) {
+      tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
+      tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
+      tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
+      tile_t t4(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile4.data_handle());
+      task4(&t4, &t1, &t2, &t3, payload);
+    };
     break;
   }
   default:
-    assert(false && "unexpected num_args");
+  assert(false && "unexpected num_args");
   };
 }
 

@@ -99,6 +99,12 @@ Test different computational kernels:
 ./main -kernel load_imbalance -iter 1000 -imbalance 0.1 -steps 3 -width 3
 ```
 
+### 4. Visualizing Task Graphs
+```bash
+CUDASTF_DOT_FILE=task_graph.dot ./main -steps 2 -width 2
+dot -Tpng task_graph.dot -o task_graph.png
+```
+
 ## Advanced Usage
 
 ### Performance Benchmarking
