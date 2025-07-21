@@ -25,7 +25,7 @@ endif
 
 # Include directories
 INC = -I../core $(CUDASTF_INCLUDE)
-INC_EXT = 
+INC_EXT = -I/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/compilers/include-stdpar
 
 # Location of the libraries
 LIB = -L../core -lcore_s

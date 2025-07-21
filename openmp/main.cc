@@ -21,6 +21,8 @@
 #include <omp.h>
 #include "core.h"
 #include "timer.h"
+#include <nvtx3/nvToolsExt.h>
+#include <string>
 
 #define VERBOSE_LEVEL 0
 
@@ -54,6 +56,7 @@ char **extra_local_memory;
 
 static inline void task1(tile_t *tile_out, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -70,10 +73,12 @@ static inline void task1(tile_t *tile_out, payload_t payload)
   tile_out->dep = 0;
   printf("Task1 tid %d, x %d, y %d, out %f\n", tid, payload.x, payload.y, tile_out->dep);
 #endif  
+  nvtxRangePop();
 }
 
 static inline void task2(tile_t *tile_out, tile_t *tile_in1, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -90,10 +95,12 @@ static inline void task2(tile_t *tile_out, tile_t *tile_in1, payload_t payload)
   tile_out->dep = tile_in1->dep + 1;
   printf("Task2 tid %d, x %d, y %d, out %f, in1 %f\n", tid, payload.x, payload.y, tile_out->dep,tile_in1->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task3(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -112,10 +119,12 @@ static inline void task3(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, p
   tile_out->dep = tile_in1->dep + tile_in2->dep + 1;
   printf("Task3 tid %d, x %d, y %d, out %f, in1 %f, in2 %f\n", tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task4(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -136,10 +145,12 @@ static inline void task4(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, t
   tile_out->dep = tile_in1->dep + tile_in2->dep + tile_in3->dep + 1;
   printf("Task4 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f\n", tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task5(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, tile_t *tile_in4, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -162,10 +173,12 @@ static inline void task5(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, t
   tile_out->dep = tile_in1->dep + tile_in2->dep + tile_in3->dep + tile_in4->dep + 1;
   printf("Task5 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f, in4 %f\n", tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep, tile_in4->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task6(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, tile_t *tile_in4, tile_t *tile_in5, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -190,10 +203,12 @@ static inline void task6(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, t
   tile_out->dep = tile_in1->dep + tile_in2->dep + tile_in3->dep + tile_in4->dep + tile_in5->dep + 1;
   printf("Task6 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f, in4 %f, in5 %f\n", tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep, tile_in4->dep, tile_in5->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task7(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, tile_t *tile_in4, tile_t *tile_in5, tile_t *tile_in6, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -221,10 +236,12 @@ static inline void task7(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, t
   printf("Task7 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f, in4 %f, in5 %f, in6 %f\n", 
     tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep, tile_in4->dep, tile_in5->dep, tile_in6->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task8(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, tile_t *tile_in4, tile_t *tile_in5, tile_t *tile_in6, tile_t *tile_in7, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -254,10 +271,12 @@ static inline void task8(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, t
   printf("Task8 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f, in4 %f, in5 %f, in6 %f, in7 %f\n", 
     tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep, tile_in4->dep, tile_in5->dep, tile_in6->dep, tile_in7->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task9(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, tile_t *tile_in4, tile_t *tile_in5, tile_t *tile_in6, tile_t *tile_in7, tile_t *tile_in8, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -289,10 +308,12 @@ static inline void task9(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, t
   printf("Task9 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f, in4 %f, in5 %f, in6 %f, in7 %f, in8 %f\n", 
     tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep, tile_in4->dep, tile_in5->dep, tile_in6->dep, tile_in7->dep, tile_in8->dep);
 #endif
+  nvtxRangePop();
 }
 
 static inline void task10(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, tile_t *tile_in4, tile_t *tile_in5, tile_t *tile_in6, tile_t *tile_in7, tile_t *tile_in8, tile_t *tile_in9, payload_t payload)
 {
+  nvtxRangePushA(("task(" + std::to_string(payload.x) + "," + std::to_string(payload.y) + ")").c_str());
   int tid = omp_get_thread_num();
 #if defined (USE_CORE_VERIFICATION)    
   TaskGraph graph = payload.graph;
@@ -326,6 +347,7 @@ static inline void task10(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, 
   printf("Task10 tid %d, x %d, y %d, out %f, in1 %f, in2 %f, in3 %f, in4 %f, in5 %f, in6 %f, in7 %f, in8 %f, in9 %f\n", 
     tid, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep, tile_in3->dep, tile_in4->dep, tile_in5->dep, tile_in6->dep, tile_in7->dep, tile_in8->dep, tile_in9->dep);
 #endif
+  nvtxRangePop();
 }
 
 struct OpenMPApp : public App {
@@ -524,34 +546,46 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
   case 1:
   {
     #pragma omp task depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
+    {
+      nvtxRangePushA("inner-task");
       task1(&mat[y0 * matrix[graph_id].N + x0], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 2: 
+  case 2:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task2(&mat[y0 * matrix[graph_id].N + x0], 
+    {
+      nvtxRangePushA("inner-task");
+      task2(&mat[y0 * matrix[graph_id].N + x0],
             &mat[y1 * matrix[graph_id].N + x1], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 3: 
+  case 3:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
     int x2 = args[2].x;
     int y2 = args[2].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task3(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
+    {
+      nvtxRangePushA("inner-task");
+      task3(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
             &mat[y2 * matrix[graph_id].N + x2], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 4: 
+  case 4:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -560,14 +594,18 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x3 = args[3].x;
     int y3 = args[3].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task4(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
+    {
+      nvtxRangePushA("inner-task");
+      task4(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
             &mat[y3 * matrix[graph_id].N + x3], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 5: 
+  case 5:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -578,15 +616,19 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x4 = args[4].x;
     int y4 = args[4].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(in: mat[y4 * matrix[graph_id].N + x4]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task5(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
-            &mat[y3 * matrix[graph_id].N + x3], 
+    {
+      nvtxRangePushA("inner-task");
+      task5(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
+            &mat[y3 * matrix[graph_id].N + x3],
             &mat[y4 * matrix[graph_id].N + x4], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 6: 
+  case 6:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -599,16 +641,20 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x5 = args[5].x;
     int y5 = args[5].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(in: mat[y4 * matrix[graph_id].N + x4]) depend(in: mat[y5 * matrix[graph_id].N + x5]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task6(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
-            &mat[y3 * matrix[graph_id].N + x3], 
-            &mat[y4 * matrix[graph_id].N + x4], 
+    {
+      nvtxRangePushA("inner-task");
+      task6(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
+            &mat[y3 * matrix[graph_id].N + x3],
+            &mat[y4 * matrix[graph_id].N + x4],
             &mat[y5 * matrix[graph_id].N + x5], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 7: 
+  case 7:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -623,17 +669,21 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x6 = args[6].x;
     int y6 = args[6].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(in: mat[y4 * matrix[graph_id].N + x4]) depend(in: mat[y5 * matrix[graph_id].N + x5]) depend(in: mat[y6 * matrix[graph_id].N + x6]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task7(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
-            &mat[y3 * matrix[graph_id].N + x3], 
-            &mat[y4 * matrix[graph_id].N + x4], 
-            &mat[y5 * matrix[graph_id].N + x5], 
+    {
+      nvtxRangePushA("inner-task");
+      task7(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
+            &mat[y3 * matrix[graph_id].N + x3],
+            &mat[y4 * matrix[graph_id].N + x4],
+            &mat[y5 * matrix[graph_id].N + x5],
             &mat[y6 * matrix[graph_id].N + x6], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 8: 
+  case 8:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -650,18 +700,22 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x7 = args[7].x;
     int y7 = args[7].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(in: mat[y4 * matrix[graph_id].N + x4]) depend(in: mat[y5 * matrix[graph_id].N + x5]) depend(in: mat[y6 * matrix[graph_id].N + x6]) depend(in: mat[y7 * matrix[graph_id].N + x7]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task8(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
-            &mat[y3 * matrix[graph_id].N + x3], 
-            &mat[y4 * matrix[graph_id].N + x4], 
-            &mat[y5 * matrix[graph_id].N + x5], 
-            &mat[y6 * matrix[graph_id].N + x6], 
+    {
+      nvtxRangePushA("inner-task");
+      task8(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
+            &mat[y3 * matrix[graph_id].N + x3],
+            &mat[y4 * matrix[graph_id].N + x4],
+            &mat[y5 * matrix[graph_id].N + x5],
+            &mat[y6 * matrix[graph_id].N + x6],
             &mat[y7 * matrix[graph_id].N + x7], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 9: 
+  case 9:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -680,19 +734,23 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x8 = args[8].x;
     int y8 = args[8].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(in: mat[y4 * matrix[graph_id].N + x4]) depend(in: mat[y5 * matrix[graph_id].N + x5]) depend(in: mat[y6 * matrix[graph_id].N + x6]) depend(in: mat[y7 * matrix[graph_id].N + x7]) depend(in: mat[y8 * matrix[graph_id].N + x8]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task9(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
-            &mat[y3 * matrix[graph_id].N + x3], 
-            &mat[y4 * matrix[graph_id].N + x4], 
-            &mat[y5 * matrix[graph_id].N + x5], 
-            &mat[y6 * matrix[graph_id].N + x6], 
-            &mat[y7 * matrix[graph_id].N + x7], 
+    {
+      nvtxRangePushA("inner-task");
+      task9(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
+            &mat[y3 * matrix[graph_id].N + x3],
+            &mat[y4 * matrix[graph_id].N + x4],
+            &mat[y5 * matrix[graph_id].N + x5],
+            &mat[y6 * matrix[graph_id].N + x6],
+            &mat[y7 * matrix[graph_id].N + x7],
             &mat[y8 * matrix[graph_id].N + x8], payload);
+      nvtxRangePop();
+    }
     break;
   }
   
-  case 10: 
+  case 10:
   {
     int x1 = args[1].x;
     int y1 = args[1].y;
@@ -713,16 +771,20 @@ void OpenMPApp::insert_task(task_args_t *args, int num_args, payload_t payload, 
     int x9 = args[9].x;
     int y9 = args[9].y;
     #pragma omp task depend(in: mat[y1 * matrix[graph_id].N + x1]) depend(in: mat[y2 * matrix[graph_id].N + x2]) depend(in: mat[y3 * matrix[graph_id].N + x3]) depend(in: mat[y4 * matrix[graph_id].N + x4]) depend(in: mat[y5 * matrix[graph_id].N + x5]) depend(in: mat[y6 * matrix[graph_id].N + x6]) depend(in: mat[y7 * matrix[graph_id].N + x7]) depend(in: mat[y8 * matrix[graph_id].N + x8]) depend(in: mat[y9 * matrix[graph_id].N + x9]) depend(inout: mat[y0 * matrix[graph_id].N + x0]) untied mergeable
-      task10(&mat[y0 * matrix[graph_id].N + x0], 
-            &mat[y1 * matrix[graph_id].N + x1], 
-            &mat[y2 * matrix[graph_id].N + x2], 
-            &mat[y3 * matrix[graph_id].N + x3], 
-            &mat[y4 * matrix[graph_id].N + x4], 
-            &mat[y5 * matrix[graph_id].N + x5], 
-            &mat[y6 * matrix[graph_id].N + x6], 
-            &mat[y7 * matrix[graph_id].N + x7], 
-            &mat[y8 * matrix[graph_id].N + x8], 
+    {
+      nvtxRangePushA("inner-task");
+      task10(&mat[y0 * matrix[graph_id].N + x0],
+            &mat[y1 * matrix[graph_id].N + x1],
+            &mat[y2 * matrix[graph_id].N + x2],
+            &mat[y3 * matrix[graph_id].N + x3],
+            &mat[y4 * matrix[graph_id].N + x4],
+            &mat[y5 * matrix[graph_id].N + x5],
+            &mat[y6 * matrix[graph_id].N + x6],
+            &mat[y7 * matrix[graph_id].N + x7],
+            &mat[y8 * matrix[graph_id].N + x8],
             &mat[y9 * matrix[graph_id].N + x9], payload);
+      nvtxRangePop();
+    }
     break;
   }
   

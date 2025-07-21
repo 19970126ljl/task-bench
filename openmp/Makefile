@@ -3,18 +3,18 @@ DEBUG ?= 0
 CXX ?= g++
 
 CXXFLAGS = -std=c++11 -Wall -fopenmp
-LDFLAGS  = -std=c++11 -Wall -fopenmp
+LDFLAGS  = -std=c++11 -Wall -fopenmp -L/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/compilers/lib
 
 ifeq ($(strip $(DEBUG)),1)
 CXXFLAGS += -g -O0
 LDFLAGS  += -g -O0
 else
-CXXFLAGS += -O3 -march=native
-LDFLAGS  += -O3 -march=native
+CXXFLAGS += -O3 -march=native -g
+LDFLAGS  += -O3 -march=native -g
 endif
 
 # Include directories
-INC        = -I../core
+INC        = -I../core -I/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8/targets/x86_64-linux/include
 INC_EXT    =  
 
 # Location of the libraries.

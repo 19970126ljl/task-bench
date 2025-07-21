@@ -23,7 +23,8 @@
 
 #include "core.h"
 #include "timer.h"
-
+// #include <nvtx3/nvToolsExt.h>
+#include <nvtx3/nvtx3.hpp>
 #define VERBOSE_LEVEL 0
 #define MAX_NUM_ARGS 10
 #define MAX_WIDTH 1024
@@ -174,16 +175,26 @@ CudaSTFApp::CudaSTFApp(int argc, char **argv)
     matrix[i].data = (tile_t*)malloc(sizeof(tile_t) * matrix[i].M * matrix[i].N);
 
     matrix[i].handles.resize(matrix[i].M * matrix[i].N);
-  
+    
+    {
+    nvtx3::scoped_range r{"Data Prepare"};
     for (int j = 0; j < matrix[i].M * matrix[i].N; j++) {
       matrix[i].data[j].output_buff = (char *)malloc(sizeof(char) * graph.output_bytes_per_task);
       // register logical data handles
       matrix[i].handles[j] = ctx.logical_data(make_slice(matrix[i].data[j].output_buff, graph.output_bytes_per_task));
     }
-    
+    }
     if (graph.scratch_bytes_per_task > max_scratch_bytes_per_task) {
       max_scratch_bytes_per_task = graph.scratch_bytes_per_task;
     }
+    // execute empty task
+    ctx.task(exec_place::host()).set_symbol("empty-task")->*[=](cudaStream_t stream) {
+        printf("empty");
+    };
+    ctx.host_launch().set_symbol("empty-task")->*[=] {
+        nvtx3::scoped_range r{"Data Prepare"};
+        printf("empty");
+    };
     
     // printf("graph id %d, M = %d, N = %d, data %p, nb_fields %d\n", i, matrix[i].M, matrix[i].N, matrix[i].data, graph.nb_fields);
   }
@@ -233,7 +244,7 @@ CudaSTFApp::~CudaSTFApp() {
 
 static inline void task1(tile_t *tile_out, payload_t payload)
 {
-#if defined (USE_CORE_VERIFICATION)    
+#if defined (USE_CORE_VERIFICATION)
   TaskGraph graph = payload.graph;
   char *output_ptr = (char*)tile_out->output_buff;
   size_t output_bytes= graph.output_bytes_per_task;
@@ -241,17 +252,17 @@ static inline void task1(tile_t *tile_out, payload_t payload)
   std::vector<size_t> input_bytes;
   input_ptrs.push_back((char*)tile_out->output_buff);
   input_bytes.push_back(graph.output_bytes_per_task);
-  
+
   graph.execute_point(payload.y, payload.x, output_ptr, output_bytes,
                       input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
-#else  
+#else
   tile_out->dep = 0;
   printf("Task1 tid %d, x %d, y %d, out %f\n", payload.x, payload.x, payload.y, tile_out->dep);
-#endif  
+#endif
 }
 static inline void task2(tile_t *tile_out, tile_t *tile_in1, payload_t payload)
 {
-#if defined (USE_CORE_VERIFICATION)    
+#if defined (USE_CORE_VERIFICATION)
   TaskGraph graph = payload.graph;
   char *output_ptr = (char*)tile_out->output_buff;
   size_t output_bytes= graph.output_bytes_per_task;
@@ -259,17 +270,17 @@ static inline void task2(tile_t *tile_out, tile_t *tile_in1, payload_t payload)
   std::vector<size_t> input_bytes;
   input_ptrs.push_back((char*)tile_in1->output_buff);
   input_bytes.push_back(graph.output_bytes_per_task);
-  
+
   graph.execute_point(payload.y, payload.x, output_ptr, output_bytes,
                       input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
-#else  
+#else
   tile_out->dep = tile_in1->dep + 1;
   printf("Task2 tid %d, x %d, y %d, out %f, in1 %f\n", payload.x, payload.x, payload.y, tile_out->dep,tile_in1->dep);
 #endif
 }
 static inline void task3(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, payload_t payload)
 {
-#if defined (USE_CORE_VERIFICATION)    
+#if defined (USE_CORE_VERIFICATION)
   TaskGraph graph = payload.graph;
   char *output_ptr = (char*)tile_out->output_buff;
   size_t output_bytes= graph.output_bytes_per_task;
@@ -282,14 +293,14 @@ static inline void task3(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, p
 
   graph.execute_point(payload.y, payload.x, output_ptr, output_bytes,
                      input_ptrs.data(), input_bytes.data(), input_ptrs.size(), extra_local_memory[payload.x], graph.scratch_bytes_per_task);
-#else  
+#else
   tile_out->dep = tile_in1->dep + tile_in2->dep + 1;
   printf("Task3 tid %d, x %d, y %d, out %f, in1 %f, in2 %f\n", payload.x, payload.x, payload.y, tile_out->dep,tile_in1->dep, tile_in2->dep);
 #endif
 }
 static inline void task4(tile_t *tile_out, tile_t *tile_in1, tile_t *tile_in2, tile_t *tile_in3, payload_t payload)
 {
-#if defined (USE_CORE_VERIFICATION)    
+#if defined (USE_CORE_VERIFICATION)
   TaskGraph graph = payload.graph;
   char *output_ptr = (char*)tile_out->output_buff;
   size_t output_bytes= graph.output_bytes_per_task;
@@ -500,16 +511,20 @@ void CudaSTFApp::execute_main_loop()
 
   /* start timer */
   Timer::time_start();
-  
-  for (int i = 0; i < graphs.size(); i++) {
-    const TaskGraph &g = graphs[i];
+  { 
+  nvtx3::scoped_range r{"Main Loop"};
+  {
+    nvtx3::scoped_range r{"Task Submition Loop"};
+    for (int i = 0; i < graphs.size(); i++) {
+      const TaskGraph &g = graphs[i];
 
-    for (int y = 0; y < g.timesteps; y++) {
-      execute_timestep(i, y);
+      for (int y = 0; y < g.timesteps; y++) {
+        execute_timestep(i, y);
+      }
     }
   }
-
   ctx.finalize();
+  }
   double elapsed = Timer::time_end();
   report_timing(elapsed);
 }
@@ -573,7 +588,10 @@ void CudaSTFApp::execute_timestep(size_t idx, long t) {
     payload.y = t;
     payload.x = x;
     payload.graph = g;
+    {
+    nvtx3::scoped_range r{"task submit"};
     insert_task(args, num_args, payload, idx);
+    }
   }
 }
 
@@ -593,7 +611,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
   case 1:
   {
     logical_data<slice<char, 1>>& tile_buffer = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile) {
+    // ctx.task(exec_place::host(), tile_buffer.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile) {
+    ctx.host_launch(tile_buffer.write()).set_symbol("task")->*[=](auto dtile) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile.data_handle());
       task1(&t, payload);
     };
@@ -606,7 +626,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     int y1 = args[1].y;
     logical_data<slice<char, 1>>& tile_buffer1 = mat->handles[(y1 % nb_fields) * max_width + x1];
     logical_data<slice<char, 1>>& tile_buffer2 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile2.data_handle());
       task2(&t2, &t1, payload);
@@ -622,7 +644,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer1 = mat->handles[(y1 % nb_fields) * max_width + x1];
     logical_data<slice<char, 1>>& tile_buffer2 = mat->handles[(y2 % nb_fields) * max_width + x2];
     logical_data<slice<char, 1>>& tile_buffer3 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y0 % nb_fields) * max_width + x0].dep, dtile3.data_handle());
@@ -642,7 +666,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer2 = mat->handles[(y2 % nb_fields) * max_width + x2];
     logical_data<slice<char, 1>>& tile_buffer3 = mat->handles[(y3 % nb_fields) * max_width + x3];
     logical_data<slice<char, 1>>& tile_buffer4 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
@@ -666,7 +692,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer3 = mat->handles[(y3 % nb_fields) * max_width + x3];
     logical_data<slice<char, 1>>& tile_buffer4 = mat->handles[(y4 % nb_fields) * max_width + x4];
     logical_data<slice<char, 1>>& tile_buffer5 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
@@ -694,7 +722,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer4 = mat->handles[(y4 % nb_fields) * max_width + x4];
     logical_data<slice<char, 1>>& tile_buffer5 = mat->handles[(y5 % nb_fields) * max_width + x5];
     logical_data<slice<char, 1>>& tile_buffer6 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
@@ -726,7 +756,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer5 = mat->handles[(y5 % nb_fields) * max_width + x5];
     logical_data<slice<char, 1>>& tile_buffer6 = mat->handles[(y6 % nb_fields) * max_width + x6];
     logical_data<slice<char, 1>>& tile_buffer7 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
@@ -762,7 +794,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer6 = mat->handles[(y6 % nb_fields) * max_width + x6];
     logical_data<slice<char, 1>>& tile_buffer7 = mat->handles[(y7 % nb_fields) * max_width + x7];
     logical_data<slice<char, 1>>& tile_buffer8 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
@@ -802,7 +836,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer7 = mat->handles[(y7 % nb_fields) * max_width + x7];
     logical_data<slice<char, 1>>& tile_buffer8 = mat->handles[(y8 % nb_fields) * max_width + x8];
     logical_data<slice<char, 1>>& tile_buffer9 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.read(), tile_buffer9.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8, auto dtile9) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.read(), tile_buffer9.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8, auto dtile9) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.read(), tile_buffer9.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8, auto dtile9) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
@@ -846,7 +882,9 @@ void CudaSTFApp::insert_task(task_args_t *args, int num_args, payload_t payload,
     logical_data<slice<char, 1>>& tile_buffer8 = mat->handles[(y8 % nb_fields) * max_width + x8];
     logical_data<slice<char, 1>>& tile_buffer9 = mat->handles[(y9 % nb_fields) * max_width + x9];
     logical_data<slice<char, 1>>& tile_buffer10 = mat->handles[(y0 % nb_fields) * max_width + x0];
-    ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.read(), tile_buffer9.read(), tile_buffer10.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8, auto dtile9, auto dtile10) {
+    // ctx.task(exec_place::host(), tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.read(), tile_buffer9.read(), tile_buffer10.write()).set_symbol("task(" + std::to_string(x0) + "," + std::to_string(y0) + ")")->*[=](cudaStream_t stream, auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8, auto dtile9, auto dtile10) {
+    ctx.host_launch(tile_buffer1.read(), tile_buffer2.read(), tile_buffer3.read(), tile_buffer4.read(), tile_buffer5.read(), tile_buffer6.read(), tile_buffer7.read(), tile_buffer8.read(), tile_buffer9.read(), tile_buffer10.write()).set_symbol("task")->*[=](auto dtile1, auto dtile2, auto dtile3, auto dtile4, auto dtile5, auto dtile6, auto dtile7, auto dtile8, auto dtile9, auto dtile10) {
+    //   nvtx3::scoped_range r{"inner-task"};
       tile_t t1(tiles[(y1 % nb_fields) * max_width + x1].dep, dtile1.data_handle());
       tile_t t2(tiles[(y2 % nb_fields) * max_width + x2].dep, dtile2.data_handle());
       tile_t t3(tiles[(y3 % nb_fields) * max_width + x3].dep, dtile3.data_handle());
