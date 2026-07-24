@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 #include "arguments.h"
 #include "core.h"
@@ -46,17 +47,17 @@ inline const char *gpu_workload_name(KernelType type)
   throw std::logic_error("unknown GPU workload");
 }
 
-std::uint64_t workload_iterations_per_task(const TaskGraph &task_graph);
+using TaskIterationCounts = std::vector<std::uint64_t>;
+
+std::uint64_t task_iteration_count(const TaskGraph &task_graph,
+                                   const DagTask &dag_task);
+TaskIterationCounts make_task_iteration_counts(const ExpandedDag &dag);
 bool uses_task_scratch(const TaskGraph &task_graph);
 
-struct WorkloadModel {
-  std::uint64_t logical_iterations = 0;
-  std::uint64_t task_input_read_bytes = 0;
-  std::uint64_t task_output_write_bytes = 0;
-  std::uint64_t scratch_read_bytes = 0;
-  std::uint64_t scratch_write_bytes = 0;
+struct GpuKernelResources {
+  int registers_per_thread = 0;
+  std::size_t static_shared_memory_bytes = 0;
+  int max_active_blocks_per_sm = 0;
 };
-
-WorkloadModel workload_model(const ExpandedDag &dag);
 
 #endif

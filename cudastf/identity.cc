@@ -1,6 +1,7 @@
 #include "identity.h"
 
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -33,6 +34,18 @@ public:
   }
 
   void add_u64(std::uint64_t value) { add_unsigned(value); }
+
+  void add_f64(double value)
+  {
+    static_assert(sizeof(value) == sizeof(std::uint64_t),
+                  "double must have a 64-bit representation");
+    std::uint64_t bits = 0;
+    if (value == 0.0) {
+      value = 0.0;
+    }
+    std::memcpy(&bits, &value, sizeof(bits));
+    add_u64(bits);
+  }
 
   void add_string(const std::string &value)
   {
@@ -90,6 +103,7 @@ void add_effective_kernel_config(StableHash &hash,
   default:
     throw std::logic_error("unsupported kernel type in execution identity");
   }
+  hash.add_f64(task_graph.kernel.imbalance);
 }
 
 }  // namespace

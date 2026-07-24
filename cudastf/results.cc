@@ -188,6 +188,66 @@ std::uint64_t checked_add(std::uint64_t lhs, std::uint64_t rhs,
   return lhs + rhs;
 }
 
+std::uint64_t checked_multiply(std::uint64_t lhs, std::uint64_t rhs,
+                               const char *name)
+{
+  if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+    throw std::runtime_error(std::string(name) + " overflows uint64_t");
+  }
+  return lhs * rhs;
+}
+
+struct WorkSummary {
+  std::uint64_t total_iterations = 0;
+  std::uint64_t min_task_iterations = 0;
+  std::uint64_t max_task_iterations = 0;
+  std::uint64_t scratch_window_bytes = 0;
+  std::uint64_t scratch_read_bytes_per_iteration = 0;
+  std::uint64_t scratch_write_bytes_per_iteration = 0;
+  std::uint64_t total_scratch_read_bytes = 0;
+  std::uint64_t total_scratch_write_bytes = 0;
+};
+
+WorkSummary summarize_work(
+    const TaskGraph &task_graph,
+    const TaskIterationCounts &task_iteration_counts)
+{
+  WorkSummary result;
+  bool have_task = false;
+  for (std::uint64_t iterations : task_iteration_counts) {
+    result.total_iterations =
+        checked_add(result.total_iterations, iterations,
+                    "workload iteration count");
+    if (!have_task) {
+      result.min_task_iterations = iterations;
+      have_task = true;
+    } else {
+      result.min_task_iterations =
+          std::min(result.min_task_iterations, iterations);
+    }
+    result.max_task_iterations =
+        std::max(result.max_task_iterations, iterations);
+  }
+
+  if (uses_task_scratch(task_graph)) {
+    const std::uint64_t samples =
+        static_cast<std::uint64_t>(task_graph.kernel.samples);
+    result.scratch_window_bytes =
+        task_graph.scratch_bytes_per_task / samples;
+    const std::uint64_t copy_bytes =
+        result.scratch_window_bytes / 2;
+    result.scratch_read_bytes_per_iteration = copy_bytes;
+    result.scratch_write_bytes_per_iteration = copy_bytes;
+    result.total_scratch_read_bytes =
+        checked_multiply(result.total_iterations, copy_bytes,
+                         "scratch read byte count");
+    result.total_scratch_write_bytes =
+        checked_multiply(result.total_iterations, copy_bytes,
+                         "scratch write byte count");
+  }
+  return result;
+}
+
 std::uint64_t total_tasks(
     const std::vector<ExpandedDag> &expanded_dags)
 {
@@ -232,14 +292,31 @@ std::uint64_t total_task_data_store_bytes(
   return result;
 }
 
-std::size_t max_fanin(
-    const std::vector<ExpandedDag> &expanded_dags)
+void validate_dag_results(
+    const std::vector<ExpandedDag> &expanded_dags,
+    const std::vector<TaskIterationCounts> &task_iteration_counts,
+    const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+    const std::vector<GpuKernelResources> &kernel_resources)
 {
-  std::size_t result = 0;
-  for (const ExpandedDag &expanded_dag : expanded_dags) {
-    result = std::max(result, expanded_dag.max_fanin);
+  if (expanded_dags.size() != gpu_kernel_configs.size()) {
+    throw std::logic_error(
+        "GPU kernel configuration count does not match DAG count");
   }
-  return result;
+  if (expanded_dags.size() != task_iteration_counts.size()) {
+    throw std::logic_error(
+        "task iteration count set does not match DAG count");
+  }
+  if (expanded_dags.size() != kernel_resources.size()) {
+    throw std::logic_error(
+        "GPU kernel resource count does not match DAG count");
+  }
+  for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
+    if (expanded_dags[i].tasks.size() !=
+        task_iteration_counts[i].size()) {
+      throw std::logic_error(
+          "task iteration count does not match DAG task count");
+    }
+  }
 }
 
 }  // namespace
@@ -258,14 +335,16 @@ PerformanceSummary summarize_performance(
 void print_report(const RunConfig &run_config,
                   const CudaDeviceInfo &device,
                   const std::vector<ExpandedDag> &expanded_dags,
+                  const std::vector<TaskIterationCounts>
+                      &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+                  const std::vector<GpuKernelResources> &kernel_resources,
                   const std::string &execution_config_hash,
                   const std::vector<SampleResult> &samples)
 {
-  if (expanded_dags.size() != gpu_kernel_configs.size()) {
-    throw std::logic_error(
-        "GPU kernel configuration count does not match DAG count");
-  }
+  validate_dag_results(
+      expanded_dags, task_iteration_counts, gpu_kernel_configs,
+      kernel_resources);
   const PerformanceSummary summary = summarize_performance(samples);
   std::cout << "CUDASTF Task Bench\n"
             << "  Context: " << run_config.context << "\n"
@@ -278,39 +357,60 @@ void print_report(const RunConfig &run_config,
             << "  Dependency edges: " << total_edges(expanded_dags) << "\n"
             << "  Task data accesses: "
             << total_task_data_accesses(expanded_dags) << "\n"
-            << "  Max fan-in: " << max_fanin(expanded_dags) << "\n"
             << "  Task data store bytes: "
             << total_task_data_store_bytes(expanded_dags) << "\n";
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     const TaskGraph &task_graph = expanded_dags[i].task_graph;
     const GpuKernelConfig &gpu_kernel_config = gpu_kernel_configs[i];
-    const WorkloadModel model = workload_model(expanded_dags[i]);
-    std::cout << "  DAG " << i << " kernel: "
-              << kernel_name(task_graph.kernel.type)
-              << ", iterations=" << task_graph.kernel.iterations
-              << ", launch="
-              << gpu_kernel_config.launch.blocks_per_task << "x"
-              << gpu_kernel_config.launch.threads_per_block
-              << ", dynamic shared memory="
-              << gpu_kernel_config.launch.dynamic_shared_memory_bytes
-              << " bytes"
-              << ", logical iterations="
-              << model.logical_iterations
-              << ", task input reads="
-              << model.task_input_read_bytes
-              << " bytes"
-              << ", task output writes="
-              << model.task_output_write_bytes << " bytes"
-              << ", scratch reads=" << model.scratch_read_bytes
-              << " bytes"
-              << ", scratch writes=" << model.scratch_write_bytes
-              << " bytes";
+    const GpuKernelResources &resources = kernel_resources[i];
+    const WorkSummary work =
+        summarize_work(task_graph, task_iteration_counts[i]);
+    std::cout << "  DAG " << i << ":\n"
+              << "    Kernel: "
+              << kernel_name(task_graph.kernel.type);
     if (task_graph.kernel.type == KernelType::COMPUTE_BOUND) {
-      std::cout << ", compute data type="
+      std::cout << " ("
                 << compute_data_type_name(
-                    gpu_kernel_config.compute_data_type);
+                    gpu_kernel_config.compute_data_type)
+                << ")";
     }
-    std::cout << "\n";
+    std::cout << "\n"
+              << "    Work: base " << task_graph.kernel.iterations
+              << " iterations/task, imbalance "
+              << task_graph.kernel.imbalance
+              << ", effective "
+              << work.min_task_iterations << ".."
+              << work.max_task_iterations
+              << ", total " << work.total_iterations << "\n"
+              << "    Launch: "
+              << gpu_kernel_config.launch.blocks_per_task
+              << " blocks x "
+              << gpu_kernel_config.launch.threads_per_block
+              << " threads, "
+              << gpu_kernel_config.launch.dynamic_shared_memory_bytes
+              << " dynamic shared memory bytes\n"
+              << "    Resources: registers/thread "
+              << resources.registers_per_thread
+              << ", static shared memory "
+              << resources.static_shared_memory_bytes
+              << " bytes, max active blocks/SM "
+              << resources.max_active_blocks_per_sm
+              << "\n";
+    if (uses_task_scratch(task_graph)) {
+      std::cout << "    Scratch: "
+                << task_graph.scratch_bytes_per_task
+                << " allocated bytes/task, "
+                << "sample window "
+                << work.scratch_window_bytes
+                << " bytes, read "
+                << work.scratch_read_bytes_per_iteration
+                << " and write "
+                << work.scratch_write_bytes_per_iteration
+                << " bytes/iteration, total reads "
+                << work.total_scratch_read_bytes
+                << " bytes, total writes "
+                << work.total_scratch_write_bytes << " bytes\n";
+    }
   }
   std::cout << "  Execution config hash: "
             << execution_config_hash << "\n"
@@ -327,14 +427,16 @@ void write_json(const std::string &path, const RunConfig &run_config,
                 const CudaDeviceInfo &device,
                 const std::vector<std::string> &core_arguments,
                 const std::vector<ExpandedDag> &expanded_dags,
+                const std::vector<TaskIterationCounts>
+                    &task_iteration_counts,
                 const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+                const std::vector<GpuKernelResources> &kernel_resources,
                 const std::string &execution_config_hash,
                 const std::vector<SampleResult> &samples)
 {
-  if (expanded_dags.size() != gpu_kernel_configs.size()) {
-    throw std::logic_error(
-        "GPU kernel configuration count does not match DAG count");
-  }
+  validate_dag_results(
+      expanded_dags, task_iteration_counts, gpu_kernel_configs,
+      kernel_resources);
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("failed to open JSON output: " + path);
@@ -390,7 +492,9 @@ void write_json(const std::string &path, const RunConfig &run_config,
     const ExpandedDag &expanded_dag = expanded_dags[i];
     const TaskGraph &task_graph = expanded_dag.task_graph;
     const GpuKernelConfig &gpu_kernel_config = gpu_kernel_configs[i];
-    const WorkloadModel model = workload_model(expanded_dag);
+    const GpuKernelResources &resources = kernel_resources[i];
+    const WorkSummary work =
+        summarize_work(task_graph, task_iteration_counts[i]);
     out << "    {\"dag_index\":" << expanded_dag.dag_index()
         << ",\"timesteps\":" << task_graph.timesteps
         << ",\"max_width\":" << task_graph.max_width
@@ -420,14 +524,28 @@ void write_json(const std::string &path, const RunConfig &run_config,
         << gpu_kernel_config.launch.threads_per_block
         << ",\"dynamic_shared_memory_bytes\":"
         << gpu_kernel_config.launch.dynamic_shared_memory_bytes
-        << "},\"work_model\":{\"logical_iterations\":"
-        << model.logical_iterations
-        << ",\"task_input_read_bytes\":"
-        << model.task_input_read_bytes
-        << ",\"task_output_write_bytes\":"
-        << model.task_output_write_bytes
-        << ",\"scratch_read_bytes\":" << model.scratch_read_bytes
-        << ",\"scratch_write_bytes\":" << model.scratch_write_bytes
+        << "},\"resources\":{\"registers_per_thread\":"
+        << resources.registers_per_thread
+        << ",\"static_shared_memory_bytes\":"
+        << resources.static_shared_memory_bytes
+        << ",\"max_active_blocks_per_sm\":"
+        << resources.max_active_blocks_per_sm
+        << "},\"work_summary\":{\"total_iterations\":"
+        << work.total_iterations
+        << ",\"min_task_iterations\":"
+        << work.min_task_iterations
+        << ",\"max_task_iterations\":"
+        << work.max_task_iterations
+        << ",\"scratch_window_bytes\":"
+        << work.scratch_window_bytes
+        << ",\"scratch_read_bytes_per_iteration\":"
+        << work.scratch_read_bytes_per_iteration
+        << ",\"scratch_write_bytes_per_iteration\":"
+        << work.scratch_write_bytes_per_iteration
+        << ",\"total_scratch_read_bytes\":"
+        << work.total_scratch_read_bytes
+        << ",\"total_scratch_write_bytes\":"
+        << work.total_scratch_write_bytes
         << "}}"
         << ",\"topology_hash\":\"" << expanded_dag.topology_hash
         << "\",\"tasks\":" << expanded_dag.tasks.size()
@@ -435,8 +553,6 @@ void write_json(const std::string &path, const RunConfig &run_config,
         << expanded_dag.dependency_edges
         << ",\"task_data_accesses\":"
         << expanded_dag.task_data_accesses
-        << ",\"max_fanin\":"
-        << expanded_dag.max_fanin
         << ",\"task_data_store_bytes\":"
         << expanded_dag.task_data_store_bytes
         << "}";

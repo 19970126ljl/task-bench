@@ -77,18 +77,15 @@ const DagTask &find_dag_task(
 }
 
 void expect_counts(const char *name, const ExpandedDag &expanded_dag,
-                   std::uint64_t tasks, std::uint64_t edges,
-                   std::size_t max_fanin)
+                   std::uint64_t tasks, std::uint64_t edges)
 {
   if (expanded_dag.tasks.size() != tasks ||
-      expanded_dag.dependency_edges != edges ||
-      expanded_dag.max_fanin != max_fanin) {
+      expanded_dag.dependency_edges != edges) {
     std::ostringstream error;
     error << name << " count mismatch: expected (" << tasks << "," << edges
-          << "," << max_fanin << "), got ("
+          << "), got ("
           << expanded_dag.tasks.size() << ","
-          << expanded_dag.dependency_edges << ","
-          << expanded_dag.max_fanin << ")";
+          << expanded_dag.dependency_edges << ")";
     throw std::runtime_error(error.str());
   }
 }
@@ -168,17 +165,17 @@ void test_expanded_dag_goldens()
       {"-steps", "4", "-width", "8", "-type", "random_nearest",
        "-radix", "5", "-period", "3", "-fraction", "0.5"});
 
-  expect_counts("trivial", trivial, 20, 0, 0);
-  expect_counts("no_comm", no_comm, 20, 15, 1);
-  expect_counts("stencil", stencil, 20, 39, 3);
-  expect_counts("periodic", periodic, 20, 45, 3);
-  expect_counts("dom", dom, 16, 24, 2);
-  expect_counts("tree", tree, 23, 22, 1);
-  expect_counts("fft", fft, 32, 58, 3);
-  expect_counts("all_to_all", all_to_all, 12, 32, 4);
-  expect_counts("nearest", nearest, 20, 39, 3);
-  expect_counts("spread", spread, 32, 96, 4);
-  expect_counts("random_nearest", random_nearest, 32, 65, 5);
+  expect_counts("trivial", trivial, 20, 0);
+  expect_counts("no_comm", no_comm, 20, 15);
+  expect_counts("stencil", stencil, 20, 39);
+  expect_counts("periodic", periodic, 20, 45);
+  expect_counts("dom", dom, 16, 24);
+  expect_counts("tree", tree, 23, 22);
+  expect_counts("fft", fft, 32, 58);
+  expect_counts("all_to_all", all_to_all, 12, 32);
+  expect_counts("nearest", nearest, 20, 39);
+  expect_counts("spread", spread, 32, 96);
+  expect_counts("random_nearest", random_nearest, 32, 65);
 
   expect_predecessors("trivial", trivial, 1, 2, {});
   expect_predecessors("no_comm", no_comm, 1, 2, {2});
@@ -336,7 +333,7 @@ void test_execution_identity()
        "-cuda-threads-per-block", "64",
        "-cuda-compute-dtype", "fp32"});
   const std::string base_hash = execution_config_hash_for(base);
-  if (base_hash != "1ceaccf04f8ec2dc") {
+  if (base_hash != "b0da72ba5eec045c") {
     throw std::runtime_error(
         "golden execution config hash changed: " + base_hash);
   }
@@ -355,6 +352,23 @@ void test_execution_identity()
   if (base_hash == execution_config_hash_for(changed_iterations)) {
     throw std::runtime_error(
         "execution config hash ignored workload iterations");
+  }
+
+  const PreparedRun changed_imbalance = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-imbalance", "1",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32"});
+  if (base.expanded_dags[0].topology_hash !=
+      changed_imbalance.expanded_dags[0].topology_hash) {
+    throw std::runtime_error(
+        "topology hash changed with workload imbalance");
+  }
+  if (base_hash == execution_config_hash_for(changed_imbalance)) {
+    throw std::runtime_error(
+        "execution config hash ignored workload imbalance");
   }
 
   std::vector<GpuKernelConfig> changed_config =
@@ -433,7 +447,7 @@ void test_execution_identity()
   }
 }
 
-void test_workload_model()
+void test_task_iteration_counts()
 {
   const ExpandedDag empty =
       build_dag({"-steps", "3", "-width", "2", "-type", "no_comm",
@@ -448,54 +462,78 @@ void test_workload_model()
   const ExpandedDag compute_bound =
       build_dag({"-steps", "3", "-width", "2", "-type", "no_comm",
                  "-kernel", "compute_bound", "-iter", "100"});
-  if (workload_iterations_per_task(empty.task_graph) != 0 ||
-      workload_iterations_per_task(busy_wait.task_graph) != 100 ||
-      workload_iterations_per_task(memory_bound.task_graph) != 2 ||
-      workload_iterations_per_task(compute_bound.task_graph) != 100) {
+  if (task_iteration_count(empty.task_graph, empty.tasks[0]) != 0 ||
+      task_iteration_count(busy_wait.task_graph, busy_wait.tasks[0]) != 100 ||
+      task_iteration_count(
+          memory_bound.task_graph, memory_bound.tasks[0]) != 2 ||
+      task_iteration_count(
+          compute_bound.task_graph, compute_bound.tasks[0]) != 100) {
     throw std::runtime_error("GPU workload iteration count mismatch");
   }
 
-  const WorkloadModel empty_model = workload_model(empty);
-  if (empty_model.logical_iterations != 0 ||
-      empty_model.task_input_read_bytes != 64 ||
-      empty_model.task_output_write_bytes != 96 ||
-      empty_model.scratch_read_bytes != 0 ||
-      empty_model.scratch_write_bytes != 0) {
-    throw std::runtime_error("empty workload model mismatch");
+  const TaskIterationCounts empty_counts =
+      make_task_iteration_counts(empty);
+  const TaskIterationCounts compute_counts =
+      make_task_iteration_counts(compute_bound);
+  const TaskIterationCounts memory_counts =
+      make_task_iteration_counts(memory_bound);
+  if (empty_counts.size() != empty.tasks.size() ||
+      compute_counts.size() != compute_bound.tasks.size() ||
+      memory_counts.size() != memory_bound.tasks.size()) {
+    throw std::runtime_error("task iteration count size mismatch");
   }
-  const WorkloadModel compute_model = workload_model(compute_bound);
-  if (compute_model.logical_iterations != 600 ||
-      compute_model.task_input_read_bytes != 64 ||
-      compute_model.task_output_write_bytes != 96 ||
-      compute_model.scratch_read_bytes != 0 ||
-      compute_model.scratch_write_bytes != 0) {
-    throw std::runtime_error("compute workload model mismatch");
+  for (std::uint64_t iterations : empty_counts) {
+    if (iterations != 0) {
+      throw std::runtime_error("empty task iteration count mismatch");
+    }
   }
-  const WorkloadModel memory_model = workload_model(memory_bound);
-  if (memory_model.logical_iterations != 12 ||
-      memory_model.task_input_read_bytes != 64 ||
-      memory_model.task_output_write_bytes != 96 ||
-      memory_model.scratch_read_bytes != 192 ||
-      memory_model.scratch_write_bytes != 192) {
-    throw std::runtime_error("memory workload model mismatch");
+  for (std::uint64_t iterations : compute_counts) {
+    if (iterations != 100) {
+      throw std::runtime_error("compute task iteration count mismatch");
+    }
   }
-
-  const ExpandedDag stencil =
-      build_dag({"-steps", "2", "-width", "3", "-type", "stencil_1d",
-                 "-field", "2"});
-  const WorkloadModel stencil_model = workload_model(stencil);
-  if (stencil_model.task_input_read_bytes != 112 ||
-      stencil_model.task_output_write_bytes != 96) {
-    throw std::runtime_error("dependency data work model mismatch");
+  for (std::uint64_t iterations : memory_counts) {
+    if (iterations != 2) {
+      throw std::runtime_error("memory task iteration count mismatch");
+    }
   }
 
-  GpuKernelLaunchConfig first;
-  GpuKernelLaunchConfig second;
-  first.blocks_per_task = 1;
-  second.blocks_per_task = 64;
-  second.threads_per_block = 256;
-  if (workload_iterations_per_task(compute_bound.task_graph) != 100 ||
-      first.blocks_per_task == second.blocks_per_task) {
+  const ExpandedDag imbalanced =
+      build_dag({"-steps", "3", "-width", "3", "-type", "no_comm",
+                 "-kernel", "compute_bound", "-iter", "100",
+                 "-imbalance", "1"});
+  const DagTask &first_imbalanced_task =
+      find_dag_task(imbalanced, 0, 0);
+  const DagTask &last_imbalanced_task =
+      find_dag_task(imbalanced, 2, 2);
+  if (task_iteration_count(
+          imbalanced.task_graph, first_imbalanced_task) != 144 ||
+      task_iteration_count(
+          imbalanced.task_graph, last_imbalanced_task) != 61) {
+    throw std::runtime_error(
+        "deterministic task imbalance golden changed");
+  }
+  const TaskIterationCounts imbalanced_counts =
+      make_task_iteration_counts(imbalanced);
+  if (imbalanced_counts.size() != imbalanced.tasks.size() ||
+      imbalanced_counts.front() != 144 ||
+      imbalanced_counts.back() != 61) {
+    throw std::runtime_error(
+        "task iteration count order does not match DAG task order");
+  }
+
+  const PreparedRun first_launch = prepare_run(
+      {"-steps", "3", "-width", "2", "-type", "no_comm",
+       "-kernel", "compute_bound", "-iter", "100",
+       "-cuda-blocks-per-task", "1",
+       "-cuda-threads-per-block", "32"});
+  const PreparedRun second_launch = prepare_run(
+      {"-steps", "3", "-width", "2", "-type", "no_comm",
+       "-kernel", "compute_bound", "-iter", "100",
+       "-cuda-blocks-per-task", "64",
+       "-cuda-threads-per-block", "256"});
+  if (make_task_iteration_counts(first_launch.expanded_dags[0]) !=
+      make_task_iteration_counts(second_launch.expanded_dags[0])) {
     throw std::runtime_error(
         "GPU workload iteration count depends on launch geometry");
   }
@@ -531,7 +569,7 @@ int main()
     test_data_accesses();
     test_arguments();
     test_execution_identity();
-    test_workload_model();
+    test_task_iteration_counts();
     test_statistics();
     std::cout << "CUDASTF host unit tests passed\n";
     return 0;

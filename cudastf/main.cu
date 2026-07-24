@@ -231,7 +231,7 @@ void validate_device_memory(const std::vector<ExpandedDag> &expanded_dags)
   }
 }
 
-void validate_gpu_kernel_configs(
+std::vector<GpuKernelResources> validate_gpu_kernel_configs(
     const std::vector<ExpandedDag> &expanded_dags,
     const std::vector<GpuKernelConfig> &gpu_kernel_configs,
     const CudaDeviceInfo &device)
@@ -266,7 +266,6 @@ void validate_gpu_kernel_configs(
           "-cuda-shmem-bytes-per-block exceeds the selected device limit");
     }
 
-    (void)workload_model(expanded_dag);
     const WorkloadKernelLimits limits =
         workload_kernel_limits(
             expanded_dag.task_graph.kernel.type,
@@ -322,13 +321,30 @@ void validate_gpu_kernel_configs(
           requirement.bytes);
     }
   }
+
+  std::vector<GpuKernelResources> result;
+  result.reserve(expanded_dags.size());
+  for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
+    result.push_back(gpu_kernel_resources(
+        expanded_dags[i].task_graph.kernel.type,
+        gpu_kernel_configs[i].compute_data_type,
+        gpu_kernel_configs[i].launch));
+  }
+  return result;
 }
 
 void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
+                const TaskIterationCounts &task_iteration_counts,
                 const GpuKernelConfig &gpu_kernel_config,
                 TaskDataStore &data_store, int device_id)
 {
-  for (const DagTask &dag_task : expanded_dag.tasks) {
+  if (task_iteration_counts.size() != expanded_dag.tasks.size()) {
+    throw std::logic_error(
+        "task iteration count does not match DAG task count");
+  }
+  for (std::size_t task_index = 0;
+       task_index < expanded_dag.tasks.size(); ++task_index) {
+    const DagTask &dag_task = expanded_dag.tasks[task_index];
     const DataAccess output_access =
         output_data_access(expanded_dag, dag_task);
     if (output_access.mode != DataAccessMode::write) {
@@ -360,14 +376,21 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
             dag_task.coordinates));
     attach_gpu_workload(
         stf_task, dag_task, expanded_dag.task_graph,
+        task_iteration_counts[task_index],
         gpu_kernel_config);
   }
 }
 
 SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
+                        const std::vector<TaskIterationCounts>
+                            &task_iteration_counts,
                         const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                         int device_id)
 {
+  if (task_iteration_counts.size() != expanded_dags.size()) {
+    throw std::logic_error(
+        "task iteration count set does not match DAG count");
+  }
   const auto sample_start = Clock::now();
   cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
 
@@ -389,7 +412,8 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
              "cudaEventSynchronize start");
   const auto submission_start = Clock::now();
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
-    submit_dag(ctx, expanded_dags[i], gpu_kernel_configs[i],
+    submit_dag(ctx, expanded_dags[i], task_iteration_counts[i],
+               gpu_kernel_configs[i],
                data_stores[i], device_id);
   }
   const auto submission_stop = Clock::now();
@@ -438,10 +462,17 @@ int main(int argc, char **argv)
     }
     const std::vector<ExpandedDag> expanded_dags =
         expand_task_graphs(task_bench_app);
+    std::vector<TaskIterationCounts> task_iteration_counts;
+    task_iteration_counts.reserve(expanded_dags.size());
+    for (const ExpandedDag &expanded_dag : expanded_dags) {
+      task_iteration_counts.push_back(
+          make_task_iteration_counts(expanded_dag));
+    }
     const CudaDeviceInfo device =
         select_cuda_device(arguments.run.device_id);
-    validate_gpu_kernel_configs(
-        expanded_dags, arguments.gpu_kernel_configs, device);
+    const std::vector<GpuKernelResources> kernel_resources =
+        validate_gpu_kernel_configs(
+            expanded_dags, arguments.gpu_kernel_configs, device);
     validate_device_memory(expanded_dags);
     const std::string execution_config_hash =
         compute_execution_config_hash(
@@ -458,7 +489,6 @@ int main(int argc, char **argv)
                   << ": tasks=" << expanded_dag.tasks.size()
                   << " dependency_edges="
                   << expanded_dag.dependency_edges
-                  << " max_fanin=" << expanded_dag.max_fanin
                   << " task_data_store_bytes="
                   << expanded_dag.task_data_store_bytes
                   << " topology_hash=" << expanded_dag.topology_hash
@@ -468,6 +498,10 @@ int main(int argc, char **argv)
                   << gpu_kernel_config.launch.threads_per_block
                   << " dynamic_shared_memory_bytes="
                   << gpu_kernel_config.launch.dynamic_shared_memory_bytes
+                  << " registers_per_thread="
+                  << kernel_resources[i].registers_per_thread
+                  << " max_active_blocks_per_sm="
+                  << kernel_resources[i].max_active_blocks_per_sm
                   << "\n";
       }
       std::cout << "  Execution config hash: "
@@ -475,24 +509,26 @@ int main(int argc, char **argv)
     }
 
     for (int i = 0; i < arguments.run.warmup_samples; ++i) {
-      (void)run_sample(expanded_dags, arguments.gpu_kernel_configs,
-                       device.device_id);
+      (void)run_sample(expanded_dags, task_iteration_counts,
+                       arguments.gpu_kernel_configs, device.device_id);
     }
     std::vector<SampleResult> samples;
     samples.reserve(arguments.run.measured_samples);
     for (int i = 0; i < arguments.run.measured_samples; ++i) {
       samples.push_back(
-          run_sample(expanded_dags, arguments.gpu_kernel_configs,
-                     device.device_id));
+          run_sample(expanded_dags, task_iteration_counts,
+                     arguments.gpu_kernel_configs, device.device_id));
     }
 
     print_report(arguments.run, device, expanded_dags,
-                 arguments.gpu_kernel_configs,
+                 task_iteration_counts, arguments.gpu_kernel_configs,
+                 kernel_resources,
                  execution_config_hash, samples);
     if (!arguments.run.json_path.empty()) {
       write_json(arguments.run.json_path, arguments.run, device,
                  arguments.core_arguments, expanded_dags,
-                 arguments.gpu_kernel_configs,
+                 task_iteration_counts, arguments.gpu_kernel_configs,
+                 kernel_resources,
                  execution_config_hash, samples);
     }
     return 0;

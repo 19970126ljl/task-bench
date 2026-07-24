@@ -1,6 +1,7 @@
 #include "expanded_dag.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -46,9 +47,25 @@ std::vector<ExpandedDag> expand_task_graphs(const App &task_bench_app)
 
   for (const TaskGraph &task_graph : task_bench_app.graphs) {
     if (!is_supported_kernel(task_graph.kernel.type)) {
+      if (task_graph.kernel.type == KernelType::LOAD_IMBALANCE) {
+        throw std::runtime_error(
+            "CUDASTF applies '-imbalance' to the selected workload; "
+            "use '-kernel compute_bound -imbalance N' instead of "
+            "'-kernel load_imbalance'");
+      }
       throw std::runtime_error(
           "CUDASTF supports '-kernel empty', 'busy_wait', 'memory_bound', "
           "and 'compute_bound'");
+    }
+    if (!std::isfinite(task_graph.kernel.imbalance)) {
+      throw std::runtime_error(
+          "CUDASTF '-imbalance' must be finite");
+    }
+    if (task_graph.kernel.type == KernelType::EMPTY &&
+        task_graph.kernel.imbalance != 0.0) {
+      throw std::runtime_error(
+          "CUDASTF '-imbalance' requires '-kernel busy_wait', "
+          "'memory_bound', or 'compute_bound'");
     }
     if (task_graph.kernel.type == KernelType::MEMORY_BOUND) {
       if (task_graph.scratch_bytes_per_task == 0) {
@@ -143,9 +160,6 @@ std::vector<ExpandedDag> expand_task_graphs(const App &task_bench_app)
           throw std::runtime_error(message.str());
         }
 
-        expanded_dag.max_fanin =
-            std::max(expanded_dag.max_fanin,
-                     dag_task.predecessors.size());
         if (expanded_dag.dependency_edges >
             std::numeric_limits<std::uint64_t>::max() -
                 dag_task.predecessors.size()) {

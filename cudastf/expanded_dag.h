@@ -32,7 +32,6 @@ struct ExpandedDag {
   std::vector<DagTask> tasks;
   std::uint64_t dependency_edges = 0;
   std::uint64_t task_data_accesses = 0;
-  std::size_t max_fanin = 0;
   std::size_t task_data_store_bytes = 0;
   std::string topology_hash;
 

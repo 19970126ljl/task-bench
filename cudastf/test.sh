@@ -67,6 +67,10 @@ run_case busy_wait \
   -kernel busy_wait -iter 4096 \
   -cuda-blocks-per-task 2 -cuda-threads-per-block 64 \
   -cuda-shmem-bytes-per-block 1024
+run_case busy_wait_imbalance \
+  -steps 3 -width 4 -type no_comm -field 1 \
+  -kernel busy_wait -iter 4096 -imbalance 1 \
+  -cuda-blocks-per-task 2 -cuda-threads-per-block 64
 run_case compute_fp32 \
   -steps 3 -width 4 -type no_comm -field 1 \
   -kernel compute_bound -iter 4096 \
@@ -82,12 +86,19 @@ run_case memory_bound \
   -kernel memory_bound -iter 4 -output 64 \
   -scratch 65536 -sample 4 \
   -cuda-blocks-per-task 2 -cuda-threads-per-block 64
+run_case memory_bound_imbalance \
+  -steps 3 -width 4 -type no_comm -field 1 \
+  -kernel memory_bound -iter 4 -imbalance 1 \
+  -scratch 65536 -sample 4 \
+  -cuda-blocks-per-task 2 -cuda-threads-per-block 64
 run_case temporary_scratch_lifetime \
   -steps 1024 -width 1 -type no_comm -field 1 \
   -kernel memory_bound -iter 0 -scratch 134217728 -sample 1
 
 "$task_bench" -h >"$test_tmp/help.out" 2>&1
 grep -F "every predecessor input is read completely once" \
+  "$test_tmp/help.out" >/dev/null
+grep -F -- "-imbalance deterministically scales each" \
   "$test_tmp/help.out" >/dev/null
 
 run_case verbose -v -steps 3 -width 100 -type no_comm
@@ -129,6 +140,13 @@ CUDASTF_DEFAULT_ALLOCATOR=uncached \
   -cuda-warmup 0 -cuda-runs 1 \
   -cuda-json "$test_tmp/result-workload.json" \
   >"$test_tmp/json-workload.out" 2>&1
+"$task_bench" -steps 3 -width 3 -type no_comm -field 1 \
+  -kernel compute_bound -iter 100 -imbalance 1 \
+  -cuda-blocks-per-task 2 -cuda-threads-per-block 64 \
+  -cuda-compute-dtype fp32 \
+  -cuda-warmup 0 -cuda-runs 1 \
+  -cuda-json "$test_tmp/result-imbalance.json" \
+  >"$test_tmp/json-imbalance.out" 2>&1
 "$task_bench" \
   -steps 3 -width 4 -type no_comm -field 1 \
   -kernel memory_bound -iter 4 -scratch 65536 -sample 4 \
@@ -147,6 +165,13 @@ CUDASTF_DEFAULT_ALLOCATOR=uncached \
   -cuda-warmup 0 -cuda-runs 1 \
   -cuda-json "$test_tmp/result-multi.json" \
   >"$test_tmp/json-multi.out" 2>&1
+
+if grep -E \
+    "Max fan-in|Parallelism:|critical path|Task data: total input reads" \
+    "$test_tmp/json-a.out" >/dev/null; then
+  echo "console output contains a deferred metric" >&2
+  exit 1
+fi
 
 default_shmem=$(
   jq -r '.device.legacy_shared_memory_per_block_bytes' \
@@ -207,18 +232,31 @@ jq -e '
   .dags[0].kernel.launch.blocks_per_task == 32 and
   .dags[0].kernel.launch.threads_per_block == 128 and
   .dags[0].kernel.launch.dynamic_shared_memory_bytes == 0 and
-  .dags[0].kernel.work_model.logical_iterations == 0 and
-  .dags[0].kernel.work_model.task_input_read_bytes == 1408 and
-  .dags[0].kernel.work_model.task_output_write_bytes == 640 and
-  .dags[0].kernel.work_model.scratch_read_bytes == 0 and
-  .dags[0].kernel.work_model.scratch_write_bytes == 0 and
-  (.dags[0].kernel.work_model | has("scratch_store_bytes") | not) and
+  .dags[0].kernel.resources.registers_per_thread > 0 and
+  .dags[0].kernel.resources.static_shared_memory_bytes >= 0 and
+  .dags[0].kernel.resources.max_active_blocks_per_sm > 0 and
+  .dags[0].kernel.work_summary.total_iterations == 0 and
+  .dags[0].kernel.work_summary.min_task_iterations == 0 and
+  .dags[0].kernel.work_summary.max_task_iterations == 0 and
+  .dags[0].kernel.work_summary.scratch_window_bytes == 0 and
+  .dags[0].kernel.work_summary.scratch_read_bytes_per_iteration == 0 and
+  .dags[0].kernel.work_summary.scratch_write_bytes_per_iteration == 0 and
+  .dags[0].kernel.work_summary.total_scratch_read_bytes == 0 and
+  .dags[0].kernel.work_summary.total_scratch_write_bytes == 0 and
+  (.dags[0].kernel.work_summary |
+    has("critical_path_iterations") | not) and
+  (.dags[0].kernel.work_summary |
+    has("task_input_read_bytes") | not) and
+  (.dags[0].kernel.work_summary |
+    has("task_output_write_bytes") | not) and
   (.dags[0].topology_hash | test("^[0-9a-f]{16}$")) and
   .dags[0].tasks == 40 and
+  (.dags[0] | has("critical_path_tasks") | not) and
+  (.dags[0] | has("topology_parallelism") | not) and
   .dags[0].dependency_edges == 88 and
   .dags[0].task_data_accesses == 128 and
   (.dags[0] | has("scratch_accesses") | not) and
-  .dags[0].max_fanin == 3 and
+  (.dags[0] | has("max_fanin") | not) and
   .dags[0].task_data_store_bytes == 256 and
   (.dags[0] | has("scratch_store_bytes") | not) and
   .aggregate_counts.tasks == 40 and
@@ -250,11 +288,15 @@ execution_b=$(jq -r '.execution_config_hash' "$test_tmp/result-b.json")
 execution_workload=$(
   jq -r '.execution_config_hash' "$test_tmp/result-workload.json"
 )
+execution_imbalance=$(
+  jq -r '.execution_config_hash' "$test_tmp/result-imbalance.json"
+)
 execution_uncached=$(
   jq -r '.execution_config_hash' "$test_tmp/result-uncached.json"
 )
 test "$execution_a" = "$execution_b"
 test "$execution_a" != "$execution_workload"
+test "$execution_workload" != "$execution_imbalance"
 test "$execution_a" != "$execution_uncached"
 jq -e '.run_config.logical_data_allocator == "uncached"' \
   "$test_tmp/result-uncached.json" >/dev/null
@@ -264,23 +306,36 @@ grep -F "Logical data allocator: uncached" \
 jq -e '
   .dags[0].kernel.type == "compute_bound" and
   .dags[0].kernel.compute_data_type == "fp32" and
-  .dags[0].kernel.work_model.logical_iterations == 163840 and
-  .dags[0].kernel.work_model.task_input_read_bytes == 1408 and
-  .dags[0].kernel.work_model.task_output_write_bytes == 640 and
-  .dags[0].kernel.work_model.scratch_read_bytes == 0 and
-  .dags[0].kernel.work_model.scratch_write_bytes == 0
+  .dags[0].kernel.imbalance == 0 and
+  .dags[0].kernel.resources.registers_per_thread > 0 and
+  .dags[0].kernel.resources.max_active_blocks_per_sm > 0 and
+  .dags[0].kernel.work_summary.total_iterations == 163840 and
+  .dags[0].kernel.work_summary.min_task_iterations == 4096 and
+  .dags[0].kernel.work_summary.max_task_iterations == 4096 and
+  .dags[0].kernel.work_summary.total_scratch_read_bytes == 0 and
+  .dags[0].kernel.work_summary.total_scratch_write_bytes == 0
 ' "$test_tmp/result-workload.json" >/dev/null
+
+jq -e '
+  .dags[0].kernel.type == "compute_bound" and
+  .dags[0].kernel.imbalance == 1 and
+  .dags[0].kernel.work_summary.total_iterations == 887 and
+  .dags[0].kernel.work_summary.min_task_iterations == 59 and
+  .dags[0].kernel.work_summary.max_task_iterations == 144
+' "$test_tmp/result-imbalance.json" >/dev/null
 
 jq -e '
   .dags[0].kernel.type == "memory_bound" and
   .dags[0].kernel.compute_data_type == null and
   .dags[0].kernel.samples == 4 and
-  .dags[0].kernel.work_model.logical_iterations == 48 and
-  .dags[0].kernel.work_model.task_input_read_bytes == 128 and
-  .dags[0].kernel.work_model.task_output_write_bytes == 192 and
-  .dags[0].kernel.work_model.scratch_read_bytes == 393216 and
-  .dags[0].kernel.work_model.scratch_write_bytes == 393216 and
-  (.dags[0].kernel.work_model | has("scratch_store_bytes") | not) and
+  .dags[0].kernel.work_summary.total_iterations == 48 and
+  .dags[0].kernel.work_summary.min_task_iterations == 4 and
+  .dags[0].kernel.work_summary.max_task_iterations == 4 and
+  .dags[0].kernel.work_summary.scratch_window_bytes == 16384 and
+  .dags[0].kernel.work_summary.scratch_read_bytes_per_iteration == 8192 and
+  .dags[0].kernel.work_summary.scratch_write_bytes_per_iteration == 8192 and
+  .dags[0].kernel.work_summary.total_scratch_read_bytes == 393216 and
+  .dags[0].kernel.work_summary.total_scratch_write_bytes == 393216 and
   (.dags[0] | has("scratch_accesses") | not) and
   .dags[0].task_data_store_bytes == 64 and
   (.dags[0] | has("scratch_store_bytes") | not)
@@ -307,6 +362,14 @@ expect_failure all_to_all_33 "supports at most 32 predecessors" \
 expect_failure unsupported_kernel \
   "supports '-kernel empty', 'busy_wait', 'memory_bound', and 'compute_bound'" \
   -kernel compute_bound2
+expect_failure legacy_load_imbalance \
+  "use '-kernel compute_bound -imbalance N' instead" \
+  -kernel load_imbalance -iter 100 -imbalance 1
+expect_failure empty_imbalance \
+  "'-imbalance' requires '-kernel busy_wait', 'memory_bound', or 'compute_bound'" \
+  -kernel empty -imbalance 1
+expect_failure nonfinite_imbalance "'-imbalance' must be finite" \
+  -kernel compute_bound -iter 100 -imbalance nan
 expect_failure scratch_without_memory_bound \
   "uses '-scratch' only with '-kernel memory_bound'" \
   -scratch 8

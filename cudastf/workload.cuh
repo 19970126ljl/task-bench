@@ -150,19 +150,38 @@ template <typename T>
 __device__ __forceinline__ void run_compute_bound(
     std::uint64_t iterations)
 {
+  constexpr int accumulator_count = 8;
+  constexpr int rounds_per_iteration = 8;
   const std::uint64_t thread = global_thread_id();
   const std::uint64_t thread_count = global_thread_count();
-  T accumulator =
-      static_cast<T>(1) +
-      static_cast<T>(thread % 32) * static_cast<T>(0.001);
+  T accumulators[accumulator_count];
+#pragma unroll
+  for (int accumulator = 0; accumulator < accumulator_count;
+       ++accumulator) {
+    accumulators[accumulator] =
+        static_cast<T>(1) +
+        static_cast<T>((thread + accumulator) % 32) *
+            static_cast<T>(0.001);
+  }
   for (std::uint64_t iteration = thread; iteration < iterations;
        iteration += thread_count) {
 #pragma unroll
-    for (int operation = 0; operation < 64; ++operation) {
-      accumulator = compute_step(accumulator);
+    for (int round = 0; round < rounds_per_iteration; ++round) {
+#pragma unroll
+      for (int accumulator = 0; accumulator < accumulator_count;
+           ++accumulator) {
+        accumulators[accumulator] =
+            compute_step(accumulators[accumulator]);
+      }
     }
   }
-  retain_workload_result(accumulator);
+  T result = accumulators[0];
+#pragma unroll
+  for (int accumulator = 1; accumulator < accumulator_count;
+       ++accumulator) {
+    result += accumulators[accumulator];
+  }
+  retain_workload_result(result);
 }
 
 __device__ __forceinline__ void copy_scratch_sample(
@@ -275,10 +294,9 @@ template <typename StfTask>
 void attach_gpu_workload(
     StfTask &stf_task, const DagTask &dag_task,
     const TaskGraph &task_graph,
+    std::uint64_t iterations,
     const GpuKernelConfig &gpu_kernel_config)
 {
-  const std::uint64_t iterations =
-      workload_iterations_per_task(task_graph);
   const std::uint64_t samples =
       static_cast<std::uint64_t>(task_graph.kernel.samples);
   const std::size_t input_count = dag_task.predecessors.size();
@@ -328,6 +346,28 @@ WorkloadKernelLimits typed_workload_kernel_limits()
 }
 
 template <GpuWorkload Workload, typename ComputeT>
+GpuKernelResources typed_gpu_kernel_resources(
+    const GpuKernelLaunchConfig &launch_config)
+{
+  cudaFuncAttributes attributes{};
+  check_workload_cuda(
+      cudaFuncGetAttributes(
+          &attributes, task_workload_kernel<Workload, ComputeT>),
+      "cudaFuncGetAttributes task workload");
+  int max_active_blocks_per_sm = 0;
+  check_workload_cuda(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &max_active_blocks_per_sm,
+          task_workload_kernel<Workload, ComputeT>,
+          launch_config.threads_per_block,
+          launch_config.dynamic_shared_memory_bytes),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor task workload");
+  return {attributes.numRegs,
+          static_cast<std::size_t>(attributes.sharedSizeBytes),
+          max_active_blocks_per_sm};
+}
+
+template <GpuWorkload Workload, typename ComputeT>
 void set_typed_workload_dynamic_shared_memory_limit(std::size_t bytes)
 {
   if (bytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
@@ -359,6 +399,31 @@ inline WorkloadKernelLimits workload_kernel_limits(
     }
     return typed_workload_kernel_limits<
         GpuWorkload::compute_bound, double>();
+  }
+  throw std::logic_error("unknown GPU workload");
+}
+
+inline GpuKernelResources gpu_kernel_resources(
+    KernelType type, ComputeDataType compute_data_type,
+    const GpuKernelLaunchConfig &launch_config)
+{
+  switch (gpu_workload(type)) {
+  case GpuWorkload::empty:
+    return typed_gpu_kernel_resources<GpuWorkload::empty, float>(
+        launch_config);
+  case GpuWorkload::busy_wait:
+    return typed_gpu_kernel_resources<GpuWorkload::busy_wait, float>(
+        launch_config);
+  case GpuWorkload::memory_bound:
+    return typed_gpu_kernel_resources<GpuWorkload::memory_bound, float>(
+        launch_config);
+  case GpuWorkload::compute_bound:
+    if (compute_data_type == ComputeDataType::fp32) {
+      return typed_gpu_kernel_resources<
+          GpuWorkload::compute_bound, float>(launch_config);
+    }
+    return typed_gpu_kernel_resources<
+        GpuWorkload::compute_bound, double>(launch_config);
   }
   throw std::logic_error("unknown GPU workload");
 }

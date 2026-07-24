@@ -197,4 +197,7 @@ void print_backend_help()
   std::printf(
       "  memory_bound requires private -scratch bytes per task and uses "
       "-sample regions.\n");
+  std::printf(
+      "  -imbalance deterministically scales each busy_wait, "
+      "memory_bound, or compute_bound task.\n");
 }
