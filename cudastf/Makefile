@@ -16,7 +16,7 @@ endif
 TARGET = task_bench
 UNIT_TEST = $(BUILD_DIR)/unit_test
 SOURCES = main.cu arguments.cc data_access.cc expanded_dag.cc identity.cc \
-	  results.cc workload.cc
+	  placement.cc results.cc workload.cc
 OBJECTS = $(SOURCES:.cu=.o)
 OBJECTS := $(OBJECTS:.cc=.o)
 BACKEND_OBJECTS = $(OBJECTS) unit_test.o
@@ -123,7 +123,7 @@ $(CORE_LIB): $(CORE_OBJECTS)
 	$(AR) rcs $@ $^
 
 $(UNIT_TEST): unit_test.o arguments.o data_access.o expanded_dag.o identity.o \
-	      results.o workload.o $(CORE_LIB)
+	      placement.o results.o workload.o $(CORE_LIB)
 	@mkdir -p $(@D)
 	$(HOST_CXX) $(BACKEND_CXXFLAGS) $^ -o $@
 

@@ -269,7 +269,9 @@ void expect_parse_failure(const std::vector<std::string> &arguments,
 void test_arguments()
 {
   const Arguments arguments = parse_backend_arguments(
-      {"-steps", "3", "-cuda-blocks-per-task", "4",
+      {"-steps", "3", "-cuda-devices", "3,1",
+       "-cuda-placement", "cyclic",
+       "-cuda-blocks-per-task", "4",
        "-cuda-compute-dtype", "fp64", "-and",
        "-steps", "2", "-kernel", "busy_wait",
        "-cuda-threads-per-block", "64",
@@ -280,6 +282,10 @@ void test_arguments()
   if (arguments.run.logical_data_allocator != "cached") {
     throw std::runtime_error(
         "default logical data allocator mismatch");
+  }
+  if (arguments.run.placement.devices != std::vector<int>({3, 1}) ||
+      arguments.run.placement.policy != PlacementPolicy::cyclic) {
+    throw std::runtime_error("global task placement configuration mismatch");
   }
   const GpuKernelConfig &first = arguments.gpu_kernel_configs[0];
   const GpuKernelConfig &second = arguments.gpu_kernel_configs[1];
@@ -315,6 +321,98 @@ void test_arguments()
   expect_parse_failure(
       {"-cuda-input-read-policy", "fixed"},
       "unknown CUDASTF option");
+  expect_parse_failure(
+      {"-cuda-devices", ""}, "requires a non-empty device list");
+  expect_parse_failure(
+      {"-cuda-devices", "0,"}, "invalid value");
+  expect_parse_failure(
+      {"-cuda-devices", "0,-1"}, "invalid value");
+  expect_parse_failure(
+      {"-cuda-devices", "0,0"}, "duplicate device");
+  expect_parse_failure(
+      {"-cuda-placement", "random"}, "expected block or cyclic");
+  expect_parse_failure(
+      {"-cuda-device", "0", "-cuda-devices", "0,1"},
+      "cannot be used together");
+  expect_parse_failure(
+      {"-cuda-devices", "0,1", "-cuda-device", "0"},
+      "cannot be used together");
+}
+
+void test_task_placement()
+{
+  const ExpandedDag fixed =
+      build_dag({"-steps", "3", "-width", "10", "-type", "no_comm"});
+  TaskPlacement block{{7, 3, 5}, PlacementPolicy::block};
+  const int expected_block[] = {7, 7, 7, 7, 3, 3, 3, 5, 5, 5};
+  for (long point = 0; point < 10; ++point) {
+    const TaskCoordinates coordinates{0, 0, point};
+    if (block.device_for(fixed.task_graph, coordinates) !=
+        expected_block[point]) {
+      throw std::runtime_error("block task placement mismatch");
+    }
+  }
+
+  TaskPlacement cyclic{{7, 3, 5}, PlacementPolicy::cyclic};
+  for (long point = 0; point < 10; ++point) {
+    const TaskCoordinates coordinates{0, 0, point};
+    if (cyclic.device_for(fixed.task_graph, coordinates) !=
+        cyclic.devices[static_cast<std::size_t>(point) %
+                       cyclic.devices.size()]) {
+      throw std::runtime_error("cyclic task placement mismatch");
+    }
+  }
+
+  const ExpandedDag dynamic =
+      build_dag({"-steps", "9", "-width", "8", "-type", "dom"});
+  for (const DagTask &task : dynamic.tasks) {
+    const TaskCoordinates first_timestep{
+        task.coordinates.dag_index, 0, task.coordinates.point};
+    if (block.device_for(dynamic.task_graph, task.coordinates) !=
+        block.device_for(dynamic.task_graph, first_timestep)) {
+      throw std::runtime_error(
+          "task placement changed for a point across timesteps");
+    }
+  }
+
+  const std::size_t expected_block_counts[][2] = {
+      {1, 0}, {2, 0}, {3, 0}, {2, 2}, {1, 4},
+      {0, 4}, {0, 3}, {0, 2}, {0, 1}};
+  const std::size_t expected_cyclic_counts[][2] = {
+      {1, 0}, {1, 1}, {1, 2}, {2, 2}, {2, 3},
+      {2, 2}, {1, 2}, {1, 1}, {0, 1}};
+  TaskPlacement dynamic_block{{0, 1}, PlacementPolicy::block};
+  TaskPlacement dynamic_cyclic{{0, 1}, PlacementPolicy::cyclic};
+  std::size_t block_counts[9][2] = {};
+  std::size_t cyclic_counts[9][2] = {};
+  for (const DagTask &task : dynamic.tasks) {
+    const std::size_t timestep =
+        static_cast<std::size_t>(task.coordinates.timestep);
+    const int block_device =
+        dynamic_block.device_for(dynamic.task_graph, task.coordinates);
+    const int cyclic_device =
+        dynamic_cyclic.device_for(dynamic.task_graph, task.coordinates);
+    ++block_counts[timestep][block_device];
+    ++cyclic_counts[timestep][cyclic_device];
+  }
+  for (std::size_t timestep = 0; timestep < 9; ++timestep) {
+    for (std::size_t device = 0; device < 2; ++device) {
+      if (block_counts[timestep][device] !=
+              expected_block_counts[timestep][device] ||
+          cyclic_counts[timestep][device] !=
+              expected_cyclic_counts[timestep][device]) {
+        throw std::runtime_error(
+            "dynamic DAG task distribution mismatch");
+      }
+    }
+  }
+
+  TaskPlacement reordered{{5, 7, 3}, PlacementPolicy::block};
+  const TaskCoordinates first{0, 0, 0};
+  if (block.device_for(fixed.task_graph, first) ==
+      reordered.device_for(fixed.task_graph, first)) {
+    throw std::runtime_error("task placement ignored device-list order");
+  }
 }
 
 std::string execution_config_hash_for(const PreparedRun &run)
@@ -336,6 +434,60 @@ void test_execution_identity()
   if (base_hash != "b0da72ba5eec045c") {
     throw std::runtime_error(
         "golden execution config hash changed: " + base_hash);
+  }
+
+  const PreparedRun explicit_single = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32", "-cuda-devices", "0"});
+  const PreparedRun single_cyclic = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32", "-cuda-device", "0",
+       "-cuda-placement", "cyclic"});
+  if (base_hash != execution_config_hash_for(explicit_single) ||
+      base_hash != execution_config_hash_for(single_cyclic)) {
+    throw std::runtime_error(
+        "equivalent single-GPU options changed execution config hash");
+  }
+
+  const PreparedRun multi_block = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32", "-cuda-devices", "0,1"});
+  const PreparedRun multi_reordered = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32", "-cuda-devices", "1,0"});
+  const PreparedRun multi_cyclic = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32", "-cuda-devices", "0,1",
+       "-cuda-placement", "cyclic"});
+  if (base_hash == execution_config_hash_for(multi_block) ||
+      execution_config_hash_for(multi_block) ==
+          execution_config_hash_for(multi_reordered) ||
+      execution_config_hash_for(multi_block) ==
+          execution_config_hash_for(multi_cyclic)) {
+    throw std::runtime_error(
+        "multi-GPU execution config hash ignored placement");
+  }
+  if (base.expanded_dags[0].topology_hash !=
+          multi_block.expanded_dags[0].topology_hash ||
+      base.expanded_dags[0].topology_hash !=
+          multi_cyclic.expanded_dags[0].topology_hash) {
+    throw std::runtime_error(
+        "topology hash changed with task placement");
   }
 
   PreparedRun changed_iterations = prepare_run(
@@ -568,6 +720,7 @@ int main()
     test_expanded_dag_goldens();
     test_data_accesses();
     test_arguments();
+    test_task_placement();
     test_execution_identity();
     test_task_iteration_counts();
     test_statistics();

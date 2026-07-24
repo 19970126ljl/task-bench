@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "placement.h"
+
 struct GpuKernelLaunchConfig {
   int blocks_per_task = 32;
   int threads_per_block = 128;
@@ -22,7 +24,7 @@ struct GpuKernelConfig {
 };
 
 struct RunConfig {
-  int device_id = 0;
+  TaskPlacement placement;
   int warmup_samples = 1;
   int measured_samples = 5;
   std::string context = "stream";

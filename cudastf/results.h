@@ -46,22 +46,22 @@ struct PerformanceSummary {
 PerformanceSummary summarize_performance(
     const std::vector<SampleResult> &samples);
 void print_report(const RunConfig &run_config,
-                  const CudaDeviceInfo &device,
+                  const std::vector<CudaDeviceInfo> &devices,
                   const std::vector<ExpandedDag> &expanded_dags,
                   const std::vector<TaskIterationCounts>
                       &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                  const std::vector<GpuKernelResources> &kernel_resources,
+                  const KernelResourcesByDag &kernel_resources,
                   const std::string &execution_config_hash,
                   const std::vector<SampleResult> &samples);
 void write_json(const std::string &path, const RunConfig &run_config,
-                const CudaDeviceInfo &device,
+                const std::vector<CudaDeviceInfo> &devices,
                 const std::vector<std::string> &core_arguments,
                 const std::vector<ExpandedDag> &expanded_dags,
                 const std::vector<TaskIterationCounts>
                     &task_iteration_counts,
                 const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                const std::vector<GpuKernelResources> &kernel_resources,
+                const KernelResourcesByDag &kernel_resources,
                 const std::string &execution_config_hash,
                 const std::vector<SampleResult> &samples);
 

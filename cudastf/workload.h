@@ -55,9 +55,13 @@ TaskIterationCounts make_task_iteration_counts(const ExpandedDag &dag);
 bool uses_task_scratch(const TaskGraph &task_graph);
 
 struct GpuKernelResources {
+  int device_id = 0;
   int registers_per_thread = 0;
   std::size_t static_shared_memory_bytes = 0;
   int max_active_blocks_per_sm = 0;
 };
+
+using KernelResourcesByDag =
+    std::vector<std::vector<GpuKernelResources>>;
 
 #endif

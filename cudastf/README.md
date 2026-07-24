@@ -1,7 +1,8 @@
 # CUDASTF Task Bench backend
 
-This backend executes Task Bench DAGs with CUDASTF. It currently targets one
-GPU with `stream_ctx`; every Task Bench task submits one CUDA kernel.
+This backend executes Task Bench DAGs with CUDASTF `stream_ctx`; every Task
+Bench task submits one CUDA kernel. A sample uses one context across all
+selected GPUs, and CUDASTF manages logical-data instances and migration.
 
 ## Build
 
@@ -26,7 +27,8 @@ also be overridden.
   -kernel compute_bound -iter 65536 \
   -cuda-blocks-per-task 32 -cuda-threads-per-block 128 \
   -cuda-compute-dtype fp32 \
-  -cuda-device 0 -cuda-warmup 1 -cuda-runs 5 \
+  -cuda-devices 0,1 -cuda-placement block \
+  -cuda-warmup 1 -cuda-runs 5 \
   -cuda-json result.json
 ```
 
@@ -34,6 +36,8 @@ CUDASTF options:
 
 ```text
 -cuda-device N
+-cuda-devices N,N,...
+-cuda-placement block|cyclic
 -cuda-context stream
 -cuda-warmup N
 -cuda-runs N
@@ -46,7 +50,9 @@ CUDASTF options:
 
 Run `./cudastf/task_bench -h` for Task Bench options and current defaults.
 Launch options and compute data type apply to the current DAG and reset after
-`-and`; device and sampling options are global. `CUDASTF_DEFAULT_ALLOCATOR`
+`-and`; device placement and sampling options are global. The singular and
+plural device options cannot be combined, and the default is GPU 0.
+`CUDASTF_DEFAULT_ALLOCATOR`
 selects `cached`, `cached_fifo`, `uncached`, or `pooled` and defaults to
 `cached`.
 
@@ -101,7 +107,7 @@ must not be enabled for performance measurements.
 
 ## Limits
 
-- Only `stream_ctx` is supported.
+- Only `stream_ctx` is supported; one sample uses one context for all devices.
 - A task may have at most 32 predecessors.
 - `memory_bound` requires nonzero scratch divisible into even-sized samples;
   other workloads require `scratch=0`.

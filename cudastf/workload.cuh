@@ -362,7 +362,8 @@ GpuKernelResources typed_gpu_kernel_resources(
           launch_config.threads_per_block,
           launch_config.dynamic_shared_memory_bytes),
       "cudaOccupancyMaxActiveBlocksPerMultiprocessor task workload");
-  return {attributes.numRegs,
+  return {0,
+          attributes.numRegs,
           static_cast<std::size_t>(attributes.sharedSizeBytes),
           max_active_blocks_per_sm};
 }

@@ -296,8 +296,12 @@ void validate_dag_results(
     const std::vector<ExpandedDag> &expanded_dags,
     const std::vector<TaskIterationCounts> &task_iteration_counts,
     const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-    const std::vector<GpuKernelResources> &kernel_resources)
+    const std::vector<CudaDeviceInfo> &devices,
+    const KernelResourcesByDag &kernel_resources)
 {
+  if (devices.empty()) {
+    throw std::logic_error("CUDA device result set is empty");
+  }
   if (expanded_dags.size() != gpu_kernel_configs.size()) {
     throw std::logic_error(
         "GPU kernel configuration count does not match DAG count");
@@ -316,6 +320,18 @@ void validate_dag_results(
       throw std::logic_error(
           "task iteration count does not match DAG task count");
     }
+    if (kernel_resources[i].size() != devices.size()) {
+      throw std::logic_error(
+          "GPU kernel resource device count does not match device count");
+    }
+    for (std::size_t device_index = 0;
+         device_index < devices.size(); ++device_index) {
+      if (kernel_resources[i][device_index].device_id !=
+          devices[device_index].device_id) {
+        throw std::logic_error(
+            "GPU kernel resource device order does not match device order");
+      }
+    }
   }
 }
 
@@ -333,25 +349,31 @@ PerformanceSummary summarize_performance(
 }
 
 void print_report(const RunConfig &run_config,
-                  const CudaDeviceInfo &device,
+                  const std::vector<CudaDeviceInfo> &devices,
                   const std::vector<ExpandedDag> &expanded_dags,
                   const std::vector<TaskIterationCounts>
                       &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                  const std::vector<GpuKernelResources> &kernel_resources,
+                  const KernelResourcesByDag &kernel_resources,
                   const std::string &execution_config_hash,
                   const std::vector<SampleResult> &samples)
 {
   validate_dag_results(
       expanded_dags, task_iteration_counts, gpu_kernel_configs,
-      kernel_resources);
+      devices, kernel_resources);
   const PerformanceSummary summary = summarize_performance(samples);
   std::cout << "CUDASTF Task Bench\n"
             << "  Context: " << run_config.context << "\n"
             << "  Logical data allocator: "
             << run_config.logical_data_allocator << "\n"
-            << "  Device: " << device.device_id << " (" << device.name
-            << ")\n"
+            << "  Devices: ";
+  for (std::size_t i = 0; i < devices.size(); ++i) {
+    if (i != 0) std::cout << ", ";
+    std::cout << devices[i].device_id << " (" << devices[i].name << ")";
+  }
+  std::cout << "\n"
+            << "  Placement: "
+            << placement_policy_name(run_config.placement.policy) << "\n"
             << "  DAGs: " << expanded_dags.size() << "\n"
             << "  Tasks: " << total_tasks(expanded_dags) << "\n"
             << "  Dependency edges: " << total_edges(expanded_dags) << "\n"
@@ -362,7 +384,6 @@ void print_report(const RunConfig &run_config,
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     const TaskGraph &task_graph = expanded_dags[i].task_graph;
     const GpuKernelConfig &gpu_kernel_config = gpu_kernel_configs[i];
-    const GpuKernelResources &resources = kernel_resources[i];
     const WorkSummary work =
         summarize_work(task_graph, task_iteration_counts[i]);
     std::cout << "  DAG " << i << ":\n"
@@ -388,14 +409,18 @@ void print_report(const RunConfig &run_config,
               << gpu_kernel_config.launch.threads_per_block
               << " threads, "
               << gpu_kernel_config.launch.dynamic_shared_memory_bytes
-              << " dynamic shared memory bytes\n"
-              << "    Resources: registers/thread "
-              << resources.registers_per_thread
-              << ", static shared memory "
-              << resources.static_shared_memory_bytes
-              << " bytes, max active blocks/SM "
-              << resources.max_active_blocks_per_sm
-              << "\n";
+              << " dynamic shared memory bytes\n";
+    for (const GpuKernelResources &resources :
+         kernel_resources[i]) {
+      std::cout << "    Resources on device " << resources.device_id
+                << ": registers/thread "
+                << resources.registers_per_thread
+                << ", static shared memory "
+                << resources.static_shared_memory_bytes
+                << " bytes, max active blocks/SM "
+                << resources.max_active_blocks_per_sm
+                << "\n";
+    }
     if (uses_task_scratch(task_graph)) {
       std::cout << "    Scratch: "
                 << task_graph.scratch_bytes_per_task
@@ -424,19 +449,19 @@ void print_report(const RunConfig &run_config,
 }
 
 void write_json(const std::string &path, const RunConfig &run_config,
-                const CudaDeviceInfo &device,
+                const std::vector<CudaDeviceInfo> &devices,
                 const std::vector<std::string> &core_arguments,
                 const std::vector<ExpandedDag> &expanded_dags,
                 const std::vector<TaskIterationCounts>
                     &task_iteration_counts,
                 const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                const std::vector<GpuKernelResources> &kernel_resources,
+                const KernelResourcesByDag &kernel_resources,
                 const std::string &execution_config_hash,
                 const std::vector<SampleResult> &samples)
 {
   validate_dag_results(
       expanded_dags, task_iteration_counts, gpu_kernel_configs,
-      kernel_resources);
+      devices, kernel_resources);
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("failed to open JSON output: " + path);
@@ -458,18 +483,25 @@ void write_json(const std::string &path, const RunConfig &run_config,
       << "\",\"cuda_arch_resolved\":\""
       << json_escape(TASKBENCH_CUDA_ARCH_RESOLVED)
       << "\"},\n"
-      << "  \"cuda_runtime_version\":" << device.runtime_version << ",\n"
-      << "  \"cuda_driver_version\":" << device.driver_version << ",\n"
-      << "  \"device\":{\"device_id\":" << device.device_id
-      << ",\"name\":\""
-      << json_escape(device.name) << "\",\"uuid\":\""
-      << json_escape(device.uuid) << "\",\"compute_capability\":\""
-      << device.compute_capability_major << "."
-      << device.compute_capability_minor
-      << "\",\"legacy_shared_memory_per_block_bytes\":"
-      << device.legacy_shared_memory_per_block
-      << ",\"optin_shared_memory_per_block_bytes\":"
-      << device.optin_shared_memory_per_block << "},\n";
+      << "  \"cuda_runtime_version\":" << devices.front().runtime_version
+      << ",\n"
+      << "  \"cuda_driver_version\":" << devices.front().driver_version
+      << ",\n"
+      << "  \"devices\":[";
+  for (std::size_t i = 0; i < devices.size(); ++i) {
+    if (i != 0) out << ",";
+    const CudaDeviceInfo &device = devices[i];
+    out << "{\"device_id\":" << device.device_id << ",\"name\":\""
+        << json_escape(device.name) << "\",\"uuid\":\""
+        << json_escape(device.uuid) << "\",\"compute_capability\":\""
+        << device.compute_capability_major << "."
+        << device.compute_capability_minor
+        << "\",\"legacy_shared_memory_per_block_bytes\":"
+        << device.legacy_shared_memory_per_block
+        << ",\"optin_shared_memory_per_block_bytes\":"
+        << device.optin_shared_memory_per_block << "}";
+  }
+  out << "],\n";
 
   out << "  \"core_arguments\":[";
   for (std::size_t i = 0; i < core_arguments.size(); ++i) {
@@ -477,8 +509,15 @@ void write_json(const std::string &path, const RunConfig &run_config,
     out << "\"" << json_escape(core_arguments[i]) << "\"";
   }
   out << "],\n"
-      << "  \"run_config\":{\"device_id\":" << run_config.device_id
-      << ",\"context\":\"" << json_escape(run_config.context)
+      << "  \"run_config\":{\"device_ids\":[";
+  for (std::size_t i = 0;
+       i < run_config.placement.devices.size(); ++i) {
+    if (i != 0) out << ",";
+    out << run_config.placement.devices[i];
+  }
+  out << "],\"placement\":\""
+      << placement_policy_name(run_config.placement.policy)
+      << "\",\"context\":\"" << json_escape(run_config.context)
       << "\",\"logical_data_allocator\":\""
       << json_escape(run_config.logical_data_allocator)
       << "\",\"warmup_samples\":" << run_config.warmup_samples
@@ -492,7 +531,6 @@ void write_json(const std::string &path, const RunConfig &run_config,
     const ExpandedDag &expanded_dag = expanded_dags[i];
     const TaskGraph &task_graph = expanded_dag.task_graph;
     const GpuKernelConfig &gpu_kernel_config = gpu_kernel_configs[i];
-    const GpuKernelResources &resources = kernel_resources[i];
     const WorkSummary work =
         summarize_work(task_graph, task_iteration_counts[i]);
     out << "    {\"dag_index\":" << expanded_dag.dag_index()
@@ -524,13 +562,22 @@ void write_json(const std::string &path, const RunConfig &run_config,
         << gpu_kernel_config.launch.threads_per_block
         << ",\"dynamic_shared_memory_bytes\":"
         << gpu_kernel_config.launch.dynamic_shared_memory_bytes
-        << "},\"resources\":{\"registers_per_thread\":"
-        << resources.registers_per_thread
-        << ",\"static_shared_memory_bytes\":"
-        << resources.static_shared_memory_bytes
-        << ",\"max_active_blocks_per_sm\":"
-        << resources.max_active_blocks_per_sm
-        << "},\"work_summary\":{\"total_iterations\":"
+        << "},\"resources\":[";
+    for (std::size_t resource_index = 0;
+         resource_index < kernel_resources[i].size();
+         ++resource_index) {
+      if (resource_index != 0) out << ",";
+      const GpuKernelResources &resources =
+          kernel_resources[i][resource_index];
+      out << "{\"device_id\":" << resources.device_id
+          << ",\"registers_per_thread\":"
+          << resources.registers_per_thread
+          << ",\"static_shared_memory_bytes\":"
+          << resources.static_shared_memory_bytes
+          << ",\"max_active_blocks_per_sm\":"
+          << resources.max_active_blocks_per_sm << "}";
+    }
+    out << "],\"work_summary\":{\"total_iterations\":"
         << work.total_iterations
         << ",\"min_task_iterations\":"
         << work.min_task_iterations

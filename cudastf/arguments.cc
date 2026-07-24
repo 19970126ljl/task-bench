@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 namespace {
@@ -68,6 +69,50 @@ ComputeDataType parse_compute_data_type(const char *flag, const char *text)
                            ": " + text + "; expected fp32 or fp64");
 }
 
+std::vector<int> parse_device_list(const char *flag, const char *text)
+{
+  const std::string value(text);
+  if (value.empty()) {
+    throw std::runtime_error(std::string(flag) +
+                             " requires a non-empty device list");
+  }
+
+  std::vector<int> devices;
+  std::set<int> seen;
+  std::size_t start = 0;
+  while (start < value.size()) {
+    const std::size_t comma = value.find(',', start);
+    const std::size_t end =
+        comma == std::string::npos ? value.size() : comma;
+    if (end == start) {
+      throw std::runtime_error(std::string("invalid value for ") + flag +
+                               ": " + value);
+    }
+    const std::string item = value.substr(start, end - start);
+    const int device = parse_nonnegative_int(flag, item.c_str());
+    if (!seen.insert(device).second) {
+      throw std::runtime_error(
+          std::string(flag) + " contains duplicate device " + item);
+    }
+    devices.push_back(device);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+    if (start == value.size()) {
+      throw std::runtime_error(std::string("invalid value for ") + flag +
+                               ": " + value);
+    }
+  }
+  return devices;
+}
+
+PlacementPolicy parse_placement_policy(const char *flag, const char *text)
+{
+  if (!std::strcmp(text, "block")) return PlacementPolicy::block;
+  if (!std::strcmp(text, "cyclic")) return PlacementPolicy::cyclic;
+  throw std::runtime_error(std::string("invalid value for ") + flag +
+                           ": " + text + "; expected block or cyclic");
+}
+
 std::string logical_data_allocator_from_environment()
 {
   const char *value = std::getenv("CUDASTF_DEFAULT_ALLOCATOR");
@@ -103,12 +148,30 @@ Arguments parse_arguments(int argc, char **argv)
   arguments.core_arguments.reserve(argc);
   arguments.core_arguments.emplace_back(
       argc > 0 ? argv[0] : "task_bench");
+  bool single_device_option_seen = false;
+  bool device_list_option_seen = false;
 
   for (int i = 1; i < argc; ++i) {
     const char *arg = argv[i];
     if (!std::strcmp(arg, "-cuda-device")) {
-      arguments.run.device_id =
-          parse_nonnegative_int(arg, require_value(i, argc, argv));
+      if (device_list_option_seen) {
+        throw std::runtime_error(
+            "-cuda-device and -cuda-devices cannot be used together");
+      }
+      single_device_option_seen = true;
+      arguments.run.placement.devices = {
+          parse_nonnegative_int(arg, require_value(i, argc, argv))};
+    } else if (!std::strcmp(arg, "-cuda-devices")) {
+      if (single_device_option_seen) {
+        throw std::runtime_error(
+            "-cuda-device and -cuda-devices cannot be used together");
+      }
+      device_list_option_seen = true;
+      arguments.run.placement.devices =
+          parse_device_list(arg, require_value(i, argc, argv));
+    } else if (!std::strcmp(arg, "-cuda-placement")) {
+      arguments.run.placement.policy = parse_placement_policy(
+          arg, require_value(i, argc, argv));
     } else if (!std::strcmp(arg, "-cuda-warmup")) {
       arguments.run.warmup_samples =
           parse_nonnegative_int(arg, require_value(i, argc, argv));
@@ -174,6 +237,10 @@ void print_backend_help()
 {
   std::printf("\nCUDASTF backend options:\n");
   std::printf("  %-24s CUDA device id (default: 0)\n", "-cuda-device [INT]");
+  std::printf("  %-24s ordered CUDA device ids\n",
+              "-cuda-devices [LIST]");
+  std::printf("  %-24s task placement (default: block)\n",
+              "-cuda-placement [block|cyclic]");
   std::printf("  %-24s context mode (currently: stream)\n",
               "-cuda-context [MODE]");
   std::printf("  %-24s number of warmup samples (default: 1)\n",

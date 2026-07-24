@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -106,17 +107,8 @@ std::string format_uuid(const cudaUUID_t &uuid)
   return out.str();
 }
 
-CudaDeviceInfo select_cuda_device(int device_id)
+CudaDeviceInfo inspect_cuda_device(int device_id)
 {
-  int count = 0;
-  cuda_check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
-  if (device_id < 0 || device_id >= count) {
-    std::ostringstream message;
-    message << "invalid CUDA device " << device_id << "; available range is [0,"
-            << count - 1 << "]";
-    throw std::runtime_error(message.str());
-  }
-
   cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
   cudaDeviceProp properties{};
   cuda_check(cudaGetDeviceProperties(&properties, device_id),
@@ -137,6 +129,35 @@ CudaDeviceInfo select_cuda_device(int device_id)
              "cudaRuntimeGetVersion");
   cuda_check(cudaDriverGetVersion(&result.driver_version),
              "cudaDriverGetVersion");
+  return result;
+}
+
+std::vector<CudaDeviceInfo> inspect_cuda_devices(
+    const TaskPlacement &placement)
+{
+  if (placement.devices.empty()) {
+    throw std::runtime_error("at least one CUDA device is required");
+  }
+  int count = 0;
+  cuda_check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+  std::set<int> seen;
+  std::vector<CudaDeviceInfo> result;
+  result.reserve(placement.devices.size());
+  for (int device_id : placement.devices) {
+    if (device_id < 0 || device_id >= count) {
+      std::ostringstream message;
+      message << "invalid CUDA device " << device_id
+              << "; available range is [0," << count - 1 << "]";
+      throw std::runtime_error(message.str());
+    }
+    if (!seen.insert(device_id).second) {
+      throw std::runtime_error(
+          "CUDA device list contains duplicate device " +
+          std::to_string(device_id));
+    }
+    result.push_back(inspect_cuda_device(device_id));
+  }
+  cuda_check(cudaSetDevice(placement.devices.front()), "cudaSetDevice");
   return result;
 }
 
@@ -195,43 +216,87 @@ std::uint64_t checked_add(std::uint64_t lhs, std::uint64_t rhs,
   return lhs + rhs;
 }
 
+std::uint64_t checked_multiply(std::uint64_t lhs, std::uint64_t rhs,
+                               const char *name)
+{
+  if (lhs != 0 &&
+      rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+    throw std::runtime_error(std::string(name) + " overflows uint64_t");
+  }
+  return lhs * rhs;
+}
+
 std::uint64_t minimum_device_data_bytes(
-    const std::vector<ExpandedDag> &expanded_dags)
+    const std::vector<ExpandedDag> &expanded_dags,
+    const TaskPlacement &placement, int device_id)
 {
   std::uint64_t result = 0;
   std::uint64_t max_scratch_bytes = 0;
   for (const ExpandedDag &expanded_dag : expanded_dags) {
-    result = checked_add(
-        result, expanded_dag.task_data_store_bytes,
-        "minimum device data byte count");
-    max_scratch_bytes = std::max(
-        max_scratch_bytes,
+    std::uint64_t assigned_points = 0;
+    for (long point = 0; point < expanded_dag.task_graph.max_width;
+         ++point) {
+      const TaskCoordinates coordinates{
+          expanded_dag.dag_index(), 0, point};
+      if (placement.device_for(
+              expanded_dag.task_graph, coordinates) == device_id) {
+        ++assigned_points;
+      }
+    }
+    const std::uint64_t assigned_slots = checked_multiply(
+        assigned_points,
         static_cast<std::uint64_t>(
-            expanded_dag.task_graph.scratch_bytes_per_task));
+            expanded_dag.task_graph.nb_fields),
+        "minimum device data slot count");
+    const std::uint64_t task_data_bytes = checked_multiply(
+        assigned_slots,
+        static_cast<std::uint64_t>(
+            expanded_dag.task_graph.output_bytes_per_task),
+        "minimum device data byte count");
+    result = checked_add(
+        result, task_data_bytes,
+        "minimum device data byte count");
+    for (const DagTask &task : expanded_dag.tasks) {
+      if (placement.device_for(
+              expanded_dag.task_graph, task.coordinates) == device_id) {
+        max_scratch_bytes = std::max(
+            max_scratch_bytes,
+            static_cast<std::uint64_t>(
+                expanded_dag.task_graph.scratch_bytes_per_task));
+        break;
+      }
+    }
   }
   return checked_add(
       result, max_scratch_bytes, "minimum device data byte count");
 }
 
-void validate_device_memory(const std::vector<ExpandedDag> &expanded_dags)
+void validate_device_memory(
+    const std::vector<ExpandedDag> &expanded_dags,
+    const TaskPlacement &placement)
 {
-  std::size_t free_bytes = 0;
-  std::size_t total_bytes = 0;
-  cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
-  const std::uint64_t required_bytes =
-      minimum_device_data_bytes(expanded_dags);
-  if (required_bytes > free_bytes) {
-    std::ostringstream message;
-    message << "task data and one temporary scratch allocation require at "
-               "least "
-            << required_bytes
-            << " bytes, but the selected device currently has "
-            << free_bytes << " free bytes";
-    throw std::runtime_error(message.str());
+  for (int device_id : placement.devices) {
+    cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+    const std::uint64_t required_bytes =
+        minimum_device_data_bytes(
+            expanded_dags, placement, device_id);
+    if (required_bytes > free_bytes) {
+      std::ostringstream message;
+      message << "task data assigned to CUDA device " << device_id
+              << " and one temporary scratch allocation require at least "
+              << required_bytes << " bytes, but that device currently has "
+              << free_bytes << " free bytes";
+      throw std::runtime_error(message.str());
+    }
   }
+  cuda_check(
+      cudaSetDevice(placement.devices.front()), "cudaSetDevice");
 }
 
-std::vector<GpuKernelResources> validate_gpu_kernel_configs(
+std::vector<GpuKernelResources> validate_gpu_kernel_configs_on_device(
     const std::vector<ExpandedDag> &expanded_dags,
     const std::vector<GpuKernelConfig> &gpu_kernel_configs,
     const CudaDeviceInfo &device)
@@ -325,18 +390,41 @@ std::vector<GpuKernelResources> validate_gpu_kernel_configs(
   std::vector<GpuKernelResources> result;
   result.reserve(expanded_dags.size());
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
-    result.push_back(gpu_kernel_resources(
+    GpuKernelResources resources = gpu_kernel_resources(
         expanded_dags[i].task_graph.kernel.type,
         gpu_kernel_configs[i].compute_data_type,
-        gpu_kernel_configs[i].launch));
+        gpu_kernel_configs[i].launch);
+    resources.device_id = device.device_id;
+    result.push_back(resources);
   }
+  return result;
+}
+
+KernelResourcesByDag validate_gpu_kernel_configs(
+    const std::vector<ExpandedDag> &expanded_dags,
+    const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+    const std::vector<CudaDeviceInfo> &devices)
+{
+  KernelResourcesByDag result(expanded_dags.size());
+  for (const CudaDeviceInfo &device : devices) {
+    cuda_check(cudaSetDevice(device.device_id), "cudaSetDevice");
+    const std::vector<GpuKernelResources> device_resources =
+        validate_gpu_kernel_configs_on_device(
+            expanded_dags, gpu_kernel_configs, device);
+    for (std::size_t dag_index = 0;
+         dag_index < expanded_dags.size(); ++dag_index) {
+      result[dag_index].push_back(device_resources[dag_index]);
+    }
+  }
+  cuda_check(cudaSetDevice(devices.front().device_id), "cudaSetDevice");
   return result;
 }
 
 void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
                 const TaskIterationCounts &task_iteration_counts,
                 const GpuKernelConfig &gpu_kernel_config,
-                TaskDataStore &data_store, int device_id)
+                TaskDataStore &data_store,
+                const TaskPlacement &placement)
 {
   if (task_iteration_counts.size() != expanded_dag.tasks.size()) {
     throw std::logic_error(
@@ -350,6 +438,8 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
     if (output_access.mode != DataAccessMode::write) {
       throw std::logic_error("task output is not a write access");
     }
+    const int device_id = placement.device_for(
+        expanded_dag.task_graph, dag_task.coordinates);
     auto stf_task = ctx.task(exec_place::device(device_id));
     stf_task.add_deps(data_store.at(output_access.data).write());
 
@@ -385,14 +475,18 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
                         const std::vector<TaskIterationCounts>
                             &task_iteration_counts,
                         const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                        int device_id)
+                        const TaskPlacement &placement)
 {
   if (task_iteration_counts.size() != expanded_dags.size()) {
     throw std::logic_error(
         "task iteration count set does not match DAG count");
   }
+  if (placement.devices.empty()) {
+    throw std::logic_error("sample task placement has no devices");
+  }
+  const int timing_device = placement.devices.front();
   const auto sample_start = Clock::now();
-  cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
+  cuda_check(cudaSetDevice(timing_device), "cudaSetDevice");
 
   const auto setup_start = Clock::now();
   CudaEvent start_event("cudaEventCreate start");
@@ -414,14 +508,16 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     submit_dag(ctx, expanded_dags[i], task_iteration_counts[i],
                gpu_kernel_configs[i],
-               data_stores[i], device_id);
+               data_stores[i], placement);
   }
   const auto submission_stop = Clock::now();
+  cuda_check(cudaSetDevice(timing_device), "cudaSetDevice");
   cuda_check(cudaEventRecord(stop_event.get(), ctx.fence()),
              "cudaEventRecord stop");
   cuda_check(cudaEventSynchronize(stop_event.get()),
              "cudaEventSynchronize stop");
   ctx.finalize();
+  cuda_check(cudaSetDevice(timing_device), "cudaSetDevice");
   cuda_check(cudaGetLastError(), "CUDASTF execution");
 
   float dag_makespan = 0.0f;
@@ -468,12 +564,12 @@ int main(int argc, char **argv)
       task_iteration_counts.push_back(
           make_task_iteration_counts(expanded_dag));
     }
-    const CudaDeviceInfo device =
-        select_cuda_device(arguments.run.device_id);
-    const std::vector<GpuKernelResources> kernel_resources =
+    const std::vector<CudaDeviceInfo> devices =
+        inspect_cuda_devices(arguments.run.placement);
+    const KernelResourcesByDag kernel_resources =
         validate_gpu_kernel_configs(
-            expanded_dags, arguments.gpu_kernel_configs, device);
-    validate_device_memory(expanded_dags);
+            expanded_dags, arguments.gpu_kernel_configs, devices);
+    validate_device_memory(expanded_dags, arguments.run.placement);
     const std::string execution_config_hash =
         compute_execution_config_hash(
             arguments.run, arguments.gpu_kernel_configs, expanded_dags);
@@ -498,11 +594,16 @@ int main(int argc, char **argv)
                   << gpu_kernel_config.launch.threads_per_block
                   << " dynamic_shared_memory_bytes="
                   << gpu_kernel_config.launch.dynamic_shared_memory_bytes
-                  << " registers_per_thread="
-                  << kernel_resources[i].registers_per_thread
-                  << " max_active_blocks_per_sm="
-                  << kernel_resources[i].max_active_blocks_per_sm
                   << "\n";
+        for (const GpuKernelResources &resources :
+             kernel_resources[i]) {
+          std::cout << "    device=" << resources.device_id
+                    << " registers_per_thread="
+                    << resources.registers_per_thread
+                    << " max_active_blocks_per_sm="
+                    << resources.max_active_blocks_per_sm
+                    << "\n";
+        }
       }
       std::cout << "  Execution config hash: "
                 << execution_config_hash << "\n";
@@ -510,22 +611,24 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < arguments.run.warmup_samples; ++i) {
       (void)run_sample(expanded_dags, task_iteration_counts,
-                       arguments.gpu_kernel_configs, device.device_id);
+                       arguments.gpu_kernel_configs,
+                       arguments.run.placement);
     }
     std::vector<SampleResult> samples;
     samples.reserve(arguments.run.measured_samples);
     for (int i = 0; i < arguments.run.measured_samples; ++i) {
       samples.push_back(
           run_sample(expanded_dags, task_iteration_counts,
-                     arguments.gpu_kernel_configs, device.device_id));
+                     arguments.gpu_kernel_configs,
+                     arguments.run.placement));
     }
 
-    print_report(arguments.run, device, expanded_dags,
+    print_report(arguments.run, devices, expanded_dags,
                  task_iteration_counts, arguments.gpu_kernel_configs,
                  kernel_resources,
                  execution_config_hash, samples);
     if (!arguments.run.json_path.empty()) {
-      write_json(arguments.run.json_path, arguments.run, device,
+      write_json(arguments.run.json_path, arguments.run, devices,
                  arguments.core_arguments, expanded_dags,
                  task_iteration_counts, arguments.gpu_kernel_configs,
                  kernel_resources,

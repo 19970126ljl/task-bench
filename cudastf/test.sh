@@ -128,6 +128,11 @@ grep -F "Reverse Dependencies:" "$test_tmp/full_verbose.out" >/dev/null
 "$task_bench" -steps 5 -width 8 -type stencil_1d -field 2 \
   -cuda-warmup 0 -cuda-runs 1 -cuda-json "$test_tmp/result-b.json" \
   >"$test_tmp/json-b.out" 2>&1
+"$task_bench" -steps 5 -width 8 -type stencil_1d -field 2 \
+  -cuda-devices 0 -cuda-placement cyclic \
+  -cuda-warmup 0 -cuda-runs 1 \
+  -cuda-json "$test_tmp/result-single-list.json" \
+  >"$test_tmp/json-single-list.out" 2>&1
 CUDASTF_DEFAULT_ALLOCATOR=uncached \
   "$task_bench" -steps 5 -width 8 -type stencil_1d -field 2 \
     -cuda-warmup 0 -cuda-runs 1 \
@@ -174,11 +179,11 @@ if grep -E \
 fi
 
 default_shmem=$(
-  jq -r '.device.legacy_shared_memory_per_block_bytes' \
+  jq -r '.devices[0].legacy_shared_memory_per_block_bytes' \
     "$test_tmp/result-a.json"
 )
 optin_shmem=$(
-  jq -r '.device.optin_shared_memory_per_block_bytes' \
+  jq -r '.devices[0].optin_shared_memory_per_block_bytes' \
     "$test_tmp/result-a.json"
 )
 if ((optin_shmem > default_shmem)); then
@@ -201,7 +206,8 @@ jq -e '
   (.execution_config_hash | test("^[0-9a-f]{16}$")) and
   .run_config.context == "stream" and
   .run_config.logical_data_allocator == "cached" and
-  .run_config.device_id == 0 and
+  .run_config.device_ids == [0] and
+  .run_config.placement == "block" and
   .run_config.warmup_samples == 0 and
   .run_config.measured_samples == 2 and
   (.task_bench_revision | length) > 0 and
@@ -211,11 +217,12 @@ jq -e '
   (.build.type == "release" or .build.type == "debug") and
   (.build.cuda_arch_option | length) > 0 and
   (.build.cuda_arch_resolved | length) > 0 and
-  .device.device_id == 0 and
-  (.device.compute_capability | test("^[0-9]+\\.[0-9]+$")) and
-  .device.legacy_shared_memory_per_block_bytes > 0 and
-  .device.optin_shared_memory_per_block_bytes >=
-    .device.legacy_shared_memory_per_block_bytes and
+  (.devices | length) == 1 and
+  .devices[0].device_id == 0 and
+  (.devices[0].compute_capability | test("^[0-9]+\\.[0-9]+$")) and
+  .devices[0].legacy_shared_memory_per_block_bytes > 0 and
+  .devices[0].optin_shared_memory_per_block_bytes >=
+    .devices[0].legacy_shared_memory_per_block_bytes and
   (.dags | length) == 1 and
   .dags[0].dag_index == 0 and
   .dags[0].timesteps == 5 and
@@ -232,9 +239,11 @@ jq -e '
   .dags[0].kernel.launch.blocks_per_task == 32 and
   .dags[0].kernel.launch.threads_per_block == 128 and
   .dags[0].kernel.launch.dynamic_shared_memory_bytes == 0 and
-  .dags[0].kernel.resources.registers_per_thread > 0 and
-  .dags[0].kernel.resources.static_shared_memory_bytes >= 0 and
-  .dags[0].kernel.resources.max_active_blocks_per_sm > 0 and
+  (.dags[0].kernel.resources | length) == 1 and
+  .dags[0].kernel.resources[0].device_id == 0 and
+  .dags[0].kernel.resources[0].registers_per_thread > 0 and
+  .dags[0].kernel.resources[0].static_shared_memory_bytes >= 0 and
+  .dags[0].kernel.resources[0].max_active_blocks_per_sm > 0 and
   .dags[0].kernel.work_summary.total_iterations == 0 and
   .dags[0].kernel.work_summary.min_task_iterations == 0 and
   .dags[0].kernel.work_summary.max_task_iterations == 0 and
@@ -294,7 +303,11 @@ execution_imbalance=$(
 execution_uncached=$(
   jq -r '.execution_config_hash' "$test_tmp/result-uncached.json"
 )
+execution_single_list=$(
+  jq -r '.execution_config_hash' "$test_tmp/result-single-list.json"
+)
 test "$execution_a" = "$execution_b"
+test "$execution_a" = "$execution_single_list"
 test "$execution_a" != "$execution_workload"
 test "$execution_workload" != "$execution_imbalance"
 test "$execution_a" != "$execution_uncached"
@@ -307,8 +320,8 @@ jq -e '
   .dags[0].kernel.type == "compute_bound" and
   .dags[0].kernel.compute_data_type == "fp32" and
   .dags[0].kernel.imbalance == 0 and
-  .dags[0].kernel.resources.registers_per_thread > 0 and
-  .dags[0].kernel.resources.max_active_blocks_per_sm > 0 and
+  .dags[0].kernel.resources[0].registers_per_thread > 0 and
+  .dags[0].kernel.resources[0].max_active_blocks_per_sm > 0 and
   .dags[0].kernel.work_summary.total_iterations == 163840 and
   .dags[0].kernel.work_summary.min_task_iterations == 4096 and
   .dags[0].kernel.work_summary.max_task_iterations == 4096 and
@@ -387,6 +400,16 @@ expect_failure memory_bound_odd_sample \
   -kernel memory_bound -scratch 12 -sample 4
 expect_failure negative_device "invalid value for -cuda-device" \
   -cuda-device -1
+expect_failure empty_device_list "requires a non-empty device list" \
+  -cuda-devices ""
+expect_failure duplicate_device "contains duplicate device" \
+  -cuda-devices 0,0
+expect_failure malformed_device_list "invalid value for -cuda-devices" \
+  -cuda-devices 0,
+expect_failure conflicting_device_options "cannot be used together" \
+  -cuda-device 0 -cuda-devices 0,1
+expect_failure invalid_placement "expected block or cyclic" \
+  -cuda-placement random
 expect_failure zero_blocks "must be greater than zero" \
   -cuda-blocks-per-task 0
 expect_failure negative_threads "invalid value" \
@@ -401,6 +424,8 @@ expect_failure too_many_threads "exceeds the selected device limit" \
 expect_failure too_much_shmem "exceeds the selected device limit" \
   -cuda-shmem-bytes-per-block 999999999
 expect_failure invalid_device "invalid CUDA device" -cuda-device 9999
+expect_failure invalid_device_list "invalid CUDA device" \
+  -cuda-devices 0,9999
 max_device=$(
   sed -n 's/.*available range is \[0,\([0-9][0-9]*\)\].*/\1/p' \
     "$test_tmp/invalid_device.out"
@@ -408,7 +433,40 @@ max_device=$(
 if [[ -n $max_device ]] && ((max_device >= 1)); then
   run_case device_1 \
     -steps 2 -width 2 -type no_comm -cuda-device 1
-  grep -F "Device: 1 (" "$test_tmp/device_1.out" >/dev/null
+  grep -F "Devices: 1 (" "$test_tmp/device_1.out" >/dev/null
+
+  run_case multi_gpu_block \
+    -steps 3 -width 5 -type no_comm -field 1 \
+    -cuda-devices 0,1 -cuda-placement block
+  grep -F "Devices: 0 (" "$test_tmp/multi_gpu_block.out" >/dev/null
+  grep -F "), 1 (" "$test_tmp/multi_gpu_block.out" >/dev/null
+  grep -F "Placement: block" "$test_tmp/multi_gpu_block.out" >/dev/null
+
+  run_case multi_gpu_dom \
+    -steps 9 -width 8 -type dom \
+    -cuda-devices 0,1 -cuda-placement block
+
+  "$task_bench" \
+    -steps 3 -width 5 -type stencil_1d -field 2 \
+    -kernel compute_bound -iter 128 \
+    -cuda-blocks-per-task 2 -cuda-threads-per-block 64 \
+    -cuda-devices 0,1 -cuda-placement cyclic \
+    -cuda-warmup 0 -cuda-runs 1 \
+    -cuda-json "$test_tmp/result-multi-gpu.json" \
+    >"$test_tmp/multi-gpu-json.out" 2>&1
+  jq -e '
+    .run_config.device_ids == [0,1] and
+    .run_config.placement == "cyclic" and
+    ([.devices[].device_id] == [0,1]) and
+    ([.dags[0].kernel.resources[].device_id] == [0,1])
+  ' "$test_tmp/result-multi-gpu.json" >/dev/null
+
+  run_case multi_gpu_memory_and \
+    -steps 3 -width 4 -type no_comm -field 1 \
+    -kernel memory_bound -iter 2 -scratch 65536 -sample 2 -and \
+    -steps 3 -width 5 -type stencil_1d -field 2 \
+    -kernel empty \
+    -cuda-devices 1,0 -cuda-placement block
 fi
 expect_failure invalid_context "only the stream executor is implemented" \
   -cuda-context graph
