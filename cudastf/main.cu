@@ -23,6 +23,7 @@
 #include "expanded_dag.h"
 #include "identity.h"
 #include "results.h"
+#include "topology.h"
 #include "workload.cuh"
 
 using cuda::experimental::stf::exec_place;
@@ -133,17 +134,17 @@ CudaDeviceInfo inspect_cuda_device(int device_id)
 }
 
 std::vector<CudaDeviceInfo> inspect_cuda_devices(
-    const TaskPlacement &placement)
+    const TaskPlacement &task_placement)
 {
-  if (placement.devices.empty()) {
+  if (task_placement.devices.empty()) {
     throw std::runtime_error("at least one CUDA device is required");
   }
   int count = 0;
   cuda_check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
   std::set<int> seen;
   std::vector<CudaDeviceInfo> result;
-  result.reserve(placement.devices.size());
-  for (int device_id : placement.devices) {
+  result.reserve(task_placement.devices.size());
+  for (int device_id : task_placement.devices) {
     if (device_id < 0 || device_id >= count) {
       std::ostringstream message;
       message << "invalid CUDA device " << device_id
@@ -157,11 +158,12 @@ std::vector<CudaDeviceInfo> inspect_cuda_devices(
     }
     result.push_back(inspect_cuda_device(device_id));
   }
-  cuda_check(cudaSetDevice(placement.devices.front()), "cudaSetDevice");
+  cuda_check(
+      cudaSetDevice(task_placement.devices.front()), "cudaSetDevice");
   return result;
 }
 
-struct TaskDataStore {
+struct DependencyDataStore {
   const ExpandedDag *expanded_dag = nullptr;
   std::vector<LogicalByteData> slots;
 
@@ -178,15 +180,15 @@ struct TaskDataStore {
   }
 };
 
-TaskDataStore create_task_data_store(stream_ctx &ctx,
-                                     const ExpandedDag &expanded_dag)
+DependencyDataStore create_dependency_data_store(
+    stream_ctx &ctx, const ExpandedDag &expanded_dag)
 {
-  TaskDataStore data_store;
-  data_store.expanded_dag = &expanded_dag;
+  DependencyDataStore dependency_data_store;
+  dependency_data_store.expanded_dag = &expanded_dag;
   const std::size_t count =
       static_cast<std::size_t>(expanded_dag.task_graph.nb_fields) *
       static_cast<std::size_t>(expanded_dag.task_graph.max_width);
-  data_store.slots.reserve(count);
+  dependency_data_store.slots.reserve(count);
   for (int field = 0; field < expanded_dag.task_graph.nb_fields; ++field) {
     for (long point = 0; point < expanded_dag.task_graph.max_width;
          ++point) {
@@ -194,10 +196,10 @@ TaskDataStore create_task_data_store(stream_ctx &ctx,
           expanded_dag.task_graph.output_bytes_per_task);
       slot.set_symbol(
           make_data_symbol(expanded_dag.dag_index(), field, point));
-      data_store.slots.push_back(std::move(slot));
+      dependency_data_store.slots.push_back(std::move(slot));
     }
   }
-  return data_store;
+  return dependency_data_store;
 }
 
 std::string make_scratch_symbol(const TaskCoordinates &coordinates)
@@ -226,9 +228,9 @@ std::uint64_t checked_multiply(std::uint64_t lhs, std::uint64_t rhs,
   return lhs * rhs;
 }
 
-std::uint64_t minimum_device_data_bytes(
+std::uint64_t minimum_device_memory_bytes(
     const std::vector<ExpandedDag> &expanded_dags,
-    const TaskPlacement &placement, int device_id)
+    const TaskPlacement &task_placement, int device_id)
 {
   std::uint64_t result = 0;
   std::uint64_t max_scratch_bytes = 0;
@@ -238,7 +240,7 @@ std::uint64_t minimum_device_data_bytes(
          ++point) {
       const TaskCoordinates coordinates{
           expanded_dag.dag_index(), 0, point};
-      if (placement.device_for(
+      if (task_placement.device_for(
               expanded_dag.task_graph, coordinates) == device_id) {
         ++assigned_points;
       }
@@ -247,17 +249,17 @@ std::uint64_t minimum_device_data_bytes(
         assigned_points,
         static_cast<std::uint64_t>(
             expanded_dag.task_graph.nb_fields),
-        "minimum device data slot count");
-    const std::uint64_t task_data_bytes = checked_multiply(
+        "minimum dependency-data slot count");
+    const std::uint64_t dependency_data_bytes = checked_multiply(
         assigned_slots,
         static_cast<std::uint64_t>(
             expanded_dag.task_graph.output_bytes_per_task),
-        "minimum device data byte count");
+        "minimum dependency-data byte count");
     result = checked_add(
-        result, task_data_bytes,
-        "minimum device data byte count");
+        result, dependency_data_bytes,
+        "minimum device memory requirement");
     for (const DagTask &task : expanded_dag.tasks) {
-      if (placement.device_for(
+      if (task_placement.device_for(
               expanded_dag.task_graph, task.coordinates) == device_id) {
         max_scratch_bytes = std::max(
             max_scratch_bytes,
@@ -268,24 +270,24 @@ std::uint64_t minimum_device_data_bytes(
     }
   }
   return checked_add(
-      result, max_scratch_bytes, "minimum device data byte count");
+      result, max_scratch_bytes, "minimum device memory requirement");
 }
 
 void validate_device_memory(
     const std::vector<ExpandedDag> &expanded_dags,
-    const TaskPlacement &placement)
+    const TaskPlacement &task_placement)
 {
-  for (int device_id : placement.devices) {
+  for (int device_id : task_placement.devices) {
     cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
     const std::uint64_t required_bytes =
-        minimum_device_data_bytes(
-            expanded_dags, placement, device_id);
+        minimum_device_memory_bytes(
+            expanded_dags, task_placement, device_id);
     if (required_bytes > free_bytes) {
       std::ostringstream message;
-      message << "task data assigned to CUDA device " << device_id
+      message << "dependency data assigned to CUDA device " << device_id
               << " and one temporary scratch allocation require at least "
               << required_bytes << " bytes, but that device currently has "
               << free_bytes << " free bytes";
@@ -293,7 +295,7 @@ void validate_device_memory(
     }
   }
   cuda_check(
-      cudaSetDevice(placement.devices.front()), "cudaSetDevice");
+      cudaSetDevice(task_placement.devices.front()), "cudaSetDevice");
 }
 
 std::vector<GpuKernelResources> validate_gpu_kernel_configs_on_device(
@@ -423,8 +425,8 @@ KernelResourcesByDag validate_gpu_kernel_configs(
 void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
                 const TaskIterationCounts &task_iteration_counts,
                 const GpuKernelConfig &gpu_kernel_config,
-                TaskDataStore &data_store,
-                const TaskPlacement &placement)
+                DependencyDataStore &dependency_data_store,
+                const TaskPlacement &task_placement)
 {
   if (task_iteration_counts.size() != expanded_dag.tasks.size()) {
     throw std::logic_error(
@@ -438,10 +440,11 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
     if (output_access.mode != DataAccessMode::write) {
       throw std::logic_error("task output is not a write access");
     }
-    const int device_id = placement.device_for(
+    const int device_id = task_placement.device_for(
         expanded_dag.task_graph, dag_task.coordinates);
     auto stf_task = ctx.task(exec_place::device(device_id));
-    stf_task.add_deps(data_store.at(output_access.data).write());
+    stf_task.add_deps(
+        dependency_data_store.at(output_access.data).write());
 
     for (const Predecessor &predecessor :
          dag_task.predecessors) {
@@ -450,7 +453,8 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
       if (input_access.mode != DataAccessMode::read) {
         throw std::logic_error("task input is not a read access");
       }
-      stf_task.add_deps(data_store.at(input_access.data).read());
+      stf_task.add_deps(
+          dependency_data_store.at(input_access.data).read());
     }
 
     std::optional<LogicalByteData> scratch;
@@ -475,16 +479,16 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
                         const std::vector<TaskIterationCounts>
                             &task_iteration_counts,
                         const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                        const TaskPlacement &placement)
+                        const TaskPlacement &task_placement)
 {
   if (task_iteration_counts.size() != expanded_dags.size()) {
     throw std::logic_error(
         "task iteration count set does not match DAG count");
   }
-  if (placement.devices.empty()) {
+  if (task_placement.devices.empty()) {
     throw std::logic_error("sample task placement has no devices");
   }
-  const int timing_device = placement.devices.front();
+  const int timing_device = task_placement.devices.front();
   const auto sample_start = Clock::now();
   cuda_check(cudaSetDevice(timing_device), "cudaSetDevice");
 
@@ -493,10 +497,11 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
   CudaEvent stop_event("cudaEventCreate stop");
   stream_ctx ctx;
 
-  std::vector<TaskDataStore> data_stores;
-  data_stores.reserve(expanded_dags.size());
+  std::vector<DependencyDataStore> dependency_data_stores;
+  dependency_data_stores.reserve(expanded_dags.size());
   for (const ExpandedDag &expanded_dag : expanded_dags) {
-    data_stores.push_back(create_task_data_store(ctx, expanded_dag));
+    dependency_data_stores.push_back(
+        create_dependency_data_store(ctx, expanded_dag));
   }
   const auto setup_stop = Clock::now();
 
@@ -508,7 +513,7 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     submit_dag(ctx, expanded_dags[i], task_iteration_counts[i],
                gpu_kernel_configs[i],
-               data_stores[i], placement);
+               dependency_data_stores[i], task_placement);
   }
   const auto submission_stop = Clock::now();
   cuda_check(cudaSetDevice(timing_device), "cudaSetDevice");
@@ -558,6 +563,8 @@ int main(int argc, char **argv)
     }
     const std::vector<ExpandedDag> expanded_dags =
         expand_task_graphs(task_bench_app);
+    const TopologyMetrics topology_metrics =
+        compute_topology_metrics(expanded_dags);
     std::vector<TaskIterationCounts> task_iteration_counts;
     task_iteration_counts.reserve(expanded_dags.size());
     for (const ExpandedDag &expanded_dag : expanded_dags) {
@@ -565,54 +572,24 @@ int main(int argc, char **argv)
           make_task_iteration_counts(expanded_dag));
     }
     const std::vector<CudaDeviceInfo> devices =
-        inspect_cuda_devices(arguments.run.placement);
+        inspect_cuda_devices(arguments.run.task_placement);
     const KernelResourcesByDag kernel_resources =
         validate_gpu_kernel_configs(
             expanded_dags, arguments.gpu_kernel_configs, devices);
-    validate_device_memory(expanded_dags, arguments.run.placement);
+    validate_device_memory(
+        expanded_dags, arguments.run.task_placement);
     const std::string execution_config_hash =
         compute_execution_config_hash(
             arguments.run, arguments.gpu_kernel_configs, expanded_dags);
 
     if (task_bench_app.verbose) {
       task_bench_app.display();
-      for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
-        const ExpandedDag &expanded_dag = expanded_dags[i];
-        const GpuKernelConfig &gpu_kernel_config =
-            arguments.gpu_kernel_configs[i];
-        std::cout << "  CUDASTF DAG "
-                  << expanded_dag.dag_index()
-                  << ": tasks=" << expanded_dag.tasks.size()
-                  << " dependency_edges="
-                  << expanded_dag.dependency_edges
-                  << " task_data_store_bytes="
-                  << expanded_dag.task_data_store_bytes
-                  << " topology_hash=" << expanded_dag.topology_hash
-                  << " blocks_per_task="
-                  << gpu_kernel_config.launch.blocks_per_task
-                  << " threads_per_block="
-                  << gpu_kernel_config.launch.threads_per_block
-                  << " dynamic_shared_memory_bytes="
-                  << gpu_kernel_config.launch.dynamic_shared_memory_bytes
-                  << "\n";
-        for (const GpuKernelResources &resources :
-             kernel_resources[i]) {
-          std::cout << "    device=" << resources.device_id
-                    << " registers_per_thread="
-                    << resources.registers_per_thread
-                    << " max_active_blocks_per_sm="
-                    << resources.max_active_blocks_per_sm
-                    << "\n";
-        }
-      }
-      std::cout << "  Execution config hash: "
-                << execution_config_hash << "\n";
     }
 
     for (int i = 0; i < arguments.run.warmup_samples; ++i) {
       (void)run_sample(expanded_dags, task_iteration_counts,
                        arguments.gpu_kernel_configs,
-                       arguments.run.placement);
+                       arguments.run.task_placement);
     }
     std::vector<SampleResult> samples;
     samples.reserve(arguments.run.measured_samples);
@@ -620,19 +597,24 @@ int main(int argc, char **argv)
       samples.push_back(
           run_sample(expanded_dags, task_iteration_counts,
                      arguments.gpu_kernel_configs,
-                     arguments.run.placement));
+                     arguments.run.task_placement));
     }
 
     print_report(arguments.run, devices, expanded_dags,
                  task_iteration_counts, arguments.gpu_kernel_configs,
-                 kernel_resources,
+                 kernel_resources, topology_metrics,
                  execution_config_hash, samples);
-    if (!arguments.run.json_path.empty()) {
-      write_json(arguments.run.json_path, arguments.run, devices,
-                 arguments.core_arguments, expanded_dags,
-                 task_iteration_counts, arguments.gpu_kernel_configs,
-                 kernel_resources,
-                 execution_config_hash, samples);
+    if (!arguments.output.run_json_path.empty()) {
+      write_run_json(
+          arguments.output.run_json_path, arguments.run, devices,
+          arguments.core_arguments, expanded_dags,
+          task_iteration_counts, arguments.gpu_kernel_configs,
+          kernel_resources, execution_config_hash, samples);
+    }
+    if (!arguments.output.analysis_json_path.empty()) {
+      write_analysis_json(
+          arguments.output.analysis_json_path, expanded_dags,
+          topology_metrics, execution_config_hash);
     }
     return 0;
   } catch (const std::exception &error) {

@@ -13,6 +13,7 @@
 #include "expanded_dag.h"
 #include "identity.h"
 #include "results.h"
+#include "topology.h"
 #include "workload.h"
 
 namespace {
@@ -120,6 +121,47 @@ void expect_near(const char *name, double actual, double expected)
     error << name << ": expected " << expected << ", got " << actual;
     throw std::runtime_error(error.str());
   }
+}
+
+ExpandedDag make_layered_dag(
+    const std::vector<std::uint64_t> &level_widths)
+{
+  ExpandedDag dag;
+  dag.task_graph.graph_index = 0;
+  for (std::size_t level = 0; level < level_widths.size(); ++level) {
+    for (std::uint64_t point = 0;
+         point < level_widths[level]; ++point) {
+      DagTask task{
+          {0, static_cast<std::int64_t>(level),
+           static_cast<std::int64_t>(point)},
+          {}};
+      if (level != 0) {
+        task.predecessors.push_back(
+            {static_cast<std::int64_t>(level - 1),
+             static_cast<std::int64_t>(
+                 point % level_widths[level - 1])});
+        ++dag.dependency_edges;
+      }
+      dag.tasks.push_back(std::move(task));
+    }
+  }
+  return dag;
+}
+
+void expect_topology_failure(const char *name, const ExpandedDag &dag,
+                             const char *expected)
+{
+  try {
+    (void)compute_topology_metrics({dag});
+  } catch (const std::exception &error) {
+    if (std::string(error.what()).find(expected) == std::string::npos) {
+      throw std::runtime_error(
+          std::string(name) + ": unexpected error: " + error.what());
+    }
+    return;
+  }
+  throw std::runtime_error(
+      std::string(name) + ": expected topology analysis failure");
 }
 
 void expect_data_access(const char *name, const DataAccess &actual,
@@ -271,6 +313,8 @@ void test_arguments()
   const Arguments arguments = parse_backend_arguments(
       {"-steps", "3", "-cuda-devices", "3,1",
        "-cuda-placement", "cyclic",
+       "-cuda-json", "run.json",
+       "-cuda-analysis-json", "analysis.json",
        "-cuda-blocks-per-task", "4",
        "-cuda-compute-dtype", "fp64", "-and",
        "-steps", "2", "-kernel", "busy_wait",
@@ -283,9 +327,15 @@ void test_arguments()
     throw std::runtime_error(
         "default logical data allocator mismatch");
   }
-  if (arguments.run.placement.devices != std::vector<int>({3, 1}) ||
-      arguments.run.placement.policy != PlacementPolicy::cyclic) {
+  if (arguments.run.task_placement.devices !=
+          std::vector<int>({3, 1}) ||
+      arguments.run.task_placement.policy !=
+          TaskPlacementPolicy::cyclic) {
     throw std::runtime_error("global task placement configuration mismatch");
+  }
+  if (arguments.output.run_json_path != "run.json" ||
+      arguments.output.analysis_json_path != "analysis.json") {
+    throw std::runtime_error("output configuration mismatch");
   }
   const GpuKernelConfig &first = arguments.gpu_kernel_configs[0];
   const GpuKernelConfig &second = arguments.gpu_kernel_configs[1];
@@ -337,13 +387,32 @@ void test_arguments()
   expect_parse_failure(
       {"-cuda-devices", "0,1", "-cuda-device", "0"},
       "cannot be used together");
+  expect_parse_failure(
+      {"-cuda-json", ""}, "requires a non-empty path");
+  expect_parse_failure(
+      {"-cuda-analysis-json", ""}, "requires a non-empty path");
+  expect_parse_failure(
+      {"-cuda-json", "same.json",
+       "-cuda-analysis-json", "same.json"},
+      "require different paths");
 }
 
 void test_task_placement()
 {
+  if (std::string(task_placement_policy_name(
+          TaskPlacementPolicy::block)) != "block" ||
+      std::string(task_placement_policy_description(
+          TaskPlacementPolicy::block)) != "contiguous point ranges" ||
+      std::string(task_placement_policy_name(
+          TaskPlacementPolicy::cyclic)) != "cyclic" ||
+      std::string(task_placement_policy_description(
+          TaskPlacementPolicy::cyclic)) != "round-robin by point") {
+    throw std::runtime_error("task placement policy description mismatch");
+  }
+
   const ExpandedDag fixed =
       build_dag({"-steps", "3", "-width", "10", "-type", "no_comm"});
-  TaskPlacement block{{7, 3, 5}, PlacementPolicy::block};
+  TaskPlacement block{{7, 3, 5}, TaskPlacementPolicy::block};
   const int expected_block[] = {7, 7, 7, 7, 3, 3, 3, 5, 5, 5};
   for (long point = 0; point < 10; ++point) {
     const TaskCoordinates coordinates{0, 0, point};
@@ -353,7 +422,7 @@ void test_task_placement()
     }
   }
 
-  TaskPlacement cyclic{{7, 3, 5}, PlacementPolicy::cyclic};
+  TaskPlacement cyclic{{7, 3, 5}, TaskPlacementPolicy::cyclic};
   for (long point = 0; point < 10; ++point) {
     const TaskCoordinates coordinates{0, 0, point};
     if (cyclic.device_for(fixed.task_graph, coordinates) !=
@@ -381,8 +450,8 @@ void test_task_placement()
   const std::size_t expected_cyclic_counts[][2] = {
       {1, 0}, {1, 1}, {1, 2}, {2, 2}, {2, 3},
       {2, 2}, {1, 2}, {1, 1}, {0, 1}};
-  TaskPlacement dynamic_block{{0, 1}, PlacementPolicy::block};
-  TaskPlacement dynamic_cyclic{{0, 1}, PlacementPolicy::cyclic};
+  TaskPlacement dynamic_block{{0, 1}, TaskPlacementPolicy::block};
+  TaskPlacement dynamic_cyclic{{0, 1}, TaskPlacementPolicy::cyclic};
   std::size_t block_counts[9][2] = {};
   std::size_t cyclic_counts[9][2] = {};
   for (const DagTask &task : dynamic.tasks) {
@@ -407,7 +476,7 @@ void test_task_placement()
     }
   }
 
-  TaskPlacement reordered{{5, 7, 3}, PlacementPolicy::block};
+  TaskPlacement reordered{{5, 7, 3}, TaskPlacementPolicy::block};
   const TaskCoordinates first{0, 0, 0};
   if (block.device_for(fixed.task_graph, first) ==
       reordered.device_for(fixed.task_graph, first)) {
@@ -541,7 +610,6 @@ void test_execution_identity()
   RunConfig changed_sampling = base.arguments.run;
   changed_sampling.warmup_samples++;
   changed_sampling.measured_samples++;
-  changed_sampling.json_path = "different.json";
   if (base_hash != compute_execution_config_hash(
           changed_sampling, base.arguments.gpu_kernel_configs,
           base.expanded_dags)) {
@@ -691,6 +759,142 @@ void test_task_iteration_counts()
   }
 }
 
+void test_topology_metrics()
+{
+  const ExpandedDag trivial =
+      build_dag({"-steps", "4", "-width", "5", "-type", "trivial"});
+  const ExpandedDag no_comm =
+      build_dag({"-steps", "4", "-width", "5", "-type", "no_comm"});
+  const TopologyMetrics fixed =
+      compute_topology_metrics({trivial, no_comm});
+
+  const DagTopologyMetrics &trivial_metrics = fixed.dags[0];
+  if (trivial_metrics.tasks != 20 ||
+      trivial_metrics.dependency_edges != 0 ||
+      trivial_metrics.critical_path_length != 1 ||
+      trivial_metrics.peak_parallelism != 20) {
+    throw std::runtime_error("trivial topology metrics mismatch");
+  }
+  expect_near(
+      "trivial average parallelism",
+      trivial_metrics.average_parallelism, 20.0);
+  expect_near(
+      "trivial p50", trivial_metrics.parallelism_p50, 20.0);
+  expect_near(
+      "trivial p95", trivial_metrics.parallelism_p95, 20.0);
+  expect_near(
+      "trivial parallelism CV", trivial_metrics.parallelism_cv, 0.0);
+
+  const DagTopologyMetrics &no_comm_metrics = fixed.dags[1];
+  if (no_comm_metrics.tasks != 20 ||
+      no_comm_metrics.dependency_edges != 15 ||
+      no_comm_metrics.critical_path_length != 4 ||
+      no_comm_metrics.peak_parallelism != 5) {
+    throw std::runtime_error("no_comm topology metrics mismatch");
+  }
+  expect_near(
+      "no_comm average parallelism",
+      no_comm_metrics.average_parallelism, 5.0);
+  expect_near(
+      "no_comm p50", no_comm_metrics.parallelism_p50, 5.0);
+  expect_near(
+      "no_comm p95", no_comm_metrics.parallelism_p95, 5.0);
+  expect_near(
+      "no_comm parallelism CV", no_comm_metrics.parallelism_cv, 0.0);
+
+  const DagTopologyMetrics &fixed_combined = fixed.combined;
+  if (fixed_combined.tasks != 40 ||
+      fixed_combined.dependency_edges != 15 ||
+      fixed_combined.critical_path_length != 4 ||
+      fixed_combined.peak_parallelism != 25) {
+    throw std::runtime_error("combined fixed topology metrics mismatch");
+  }
+  expect_near(
+      "combined fixed average parallelism",
+      fixed_combined.average_parallelism, 10.0);
+  expect_near(
+      "combined fixed p50", fixed_combined.parallelism_p50, 5.0);
+  expect_near(
+      "combined fixed p95", fixed_combined.parallelism_p95, 25.0);
+  expect_near(
+      "combined fixed parallelism CV",
+      fixed_combined.parallelism_cv, std::sqrt(0.75));
+
+  const ExpandedDag irregular = make_layered_dag({2, 1, 1});
+  const DagTopologyMetrics irregular_metrics =
+      compute_topology_metrics({irregular}).dags[0];
+  if (irregular_metrics.critical_path_length != 3 ||
+      irregular_metrics.peak_parallelism != 2) {
+    throw std::runtime_error("irregular topology metrics mismatch");
+  }
+  expect_near(
+      "irregular average parallelism",
+      irregular_metrics.average_parallelism, 4.0 / 3.0);
+  expect_near(
+      "irregular p50", irregular_metrics.parallelism_p50, 1.0);
+  expect_near(
+      "irregular p95", irregular_metrics.parallelism_p95, 2.0);
+  expect_near(
+      "irregular parallelism CV",
+      irregular_metrics.parallelism_cv, std::sqrt(2.0) / 4.0);
+
+  const ExpandedDag even = make_layered_dag({1, 2, 3, 4});
+  const DagTopologyMetrics even_metrics =
+      compute_topology_metrics({even}).dags[0];
+  expect_near(
+      "even-level p50", even_metrics.parallelism_p50, 2.5);
+  expect_near(
+      "even-level p95", even_metrics.parallelism_p95, 4.0);
+
+  std::vector<std::uint64_t> twenty_level_widths(20);
+  for (std::size_t level = 0;
+       level < twenty_level_widths.size(); ++level) {
+    twenty_level_widths[level] = level + 1;
+  }
+  const DagTopologyMetrics twenty_level_metrics =
+      compute_topology_metrics(
+          {make_layered_dag(twenty_level_widths)}).dags[0];
+  expect_near(
+      "twenty-level p95",
+      twenty_level_metrics.parallelism_p95, 19.0);
+
+  const TopologyMetrics combined =
+      compute_topology_metrics(
+          {irregular, make_layered_dag({1, 3})});
+  if (combined.combined.tasks != 8 ||
+      combined.combined.dependency_edges != 5 ||
+      combined.combined.critical_path_length != 3 ||
+      combined.combined.peak_parallelism != 4) {
+    throw std::runtime_error("combined irregular topology mismatch");
+  }
+  expect_near(
+      "combined irregular average parallelism",
+      combined.combined.average_parallelism, 8.0 / 3.0);
+  expect_near(
+      "combined irregular p50",
+      combined.combined.parallelism_p50, 3.0);
+  expect_near(
+      "combined irregular p95",
+      combined.combined.parallelism_p95, 4.0);
+
+  ExpandedDag duplicate = make_layered_dag({1});
+  duplicate.tasks.push_back(duplicate.tasks.front());
+  expect_topology_failure(
+      "duplicate task", duplicate, "duplicate task");
+
+  ExpandedDag missing;
+  missing.task_graph.graph_index = 0;
+  missing.tasks.push_back({{0, 1, 0}, {{0, 0}}});
+  missing.dependency_edges = 1;
+  expect_topology_failure(
+      "missing predecessor", missing, "predecessor is missing");
+
+  ExpandedDag edge_mismatch = make_layered_dag({1, 1});
+  edge_mismatch.dependency_edges = 0;
+  expect_topology_failure(
+      "edge mismatch", edge_mismatch, "edge count does not match");
+}
+
 void test_statistics()
 {
   SampleResult first;
@@ -723,6 +927,7 @@ int main()
     test_task_placement();
     test_execution_identity();
     test_task_iteration_counts();
+    test_topology_metrics();
     test_statistics();
     std::cout << "CUDASTF host unit tests passed\n";
     return 0;

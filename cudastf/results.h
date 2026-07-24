@@ -6,6 +6,7 @@
 
 #include "arguments.h"
 #include "expanded_dag.h"
+#include "topology.h"
 #include "workload.h"
 
 struct CudaDeviceInfo {
@@ -52,17 +53,23 @@ void print_report(const RunConfig &run_config,
                       &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                   const KernelResourcesByDag &kernel_resources,
+                  const TopologyMetrics &topology_metrics,
                   const std::string &execution_config_hash,
                   const std::vector<SampleResult> &samples);
-void write_json(const std::string &path, const RunConfig &run_config,
-                const std::vector<CudaDeviceInfo> &devices,
-                const std::vector<std::string> &core_arguments,
-                const std::vector<ExpandedDag> &expanded_dags,
-                const std::vector<TaskIterationCounts>
-                    &task_iteration_counts,
-                const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                const KernelResourcesByDag &kernel_resources,
-                const std::string &execution_config_hash,
-                const std::vector<SampleResult> &samples);
+void write_run_json(
+    const std::string &path, const RunConfig &run_config,
+    const std::vector<CudaDeviceInfo> &devices,
+    const std::vector<std::string> &core_arguments,
+    const std::vector<ExpandedDag> &expanded_dags,
+    const std::vector<TaskIterationCounts> &task_iteration_counts,
+    const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+    const KernelResourcesByDag &kernel_resources,
+    const std::string &execution_config_hash,
+    const std::vector<SampleResult> &samples);
+void write_analysis_json(
+    const std::string &path,
+    const std::vector<ExpandedDag> &expanded_dags,
+    const TopologyMetrics &topology_metrics,
+    const std::string &execution_config_hash);
 
 #endif

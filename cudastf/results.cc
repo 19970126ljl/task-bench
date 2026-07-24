@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 #include "workload.h"
@@ -162,13 +163,6 @@ std::string json_escape(const std::string &input)
   return output;
 }
 
-void write_performance_metrics(std::ostream &out,
-                               const PerformanceSample &sample)
-{
-  out << "{\"submission_ms\":" << sample.submission_ms
-      << ",\"dag_makespan_ms\":" << sample.dag_makespan_ms << "}";
-}
-
 void write_sample(std::ostream &out, const SampleResult &sample)
 {
   out << "{\"submission_ms\":" << sample.performance.submission_ms
@@ -177,6 +171,50 @@ void write_sample(std::ostream &out, const SampleResult &sample)
       << sample.diagnostics.setup_ms
       << ",\"sample_total_ms\":" << sample.diagnostics.sample_total_ms
       << "}}";
+}
+
+void print_topology_metrics(const char *indent,
+                            const DagTopologyMetrics &metrics)
+{
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(3)
+      << indent << "Topology (unit task cost):\n"
+      << indent << "  Critical path length: "
+      << metrics.critical_path_length << "\n"
+      << indent << "  Parallelism: average "
+      << metrics.average_parallelism << ", peak "
+      << metrics.peak_parallelism << ", p50 "
+      << metrics.parallelism_p50 << ", p95 "
+      << metrics.parallelism_p95 << ", CV "
+      << metrics.parallelism_cv << "\n";
+  std::cout << out.str();
+}
+
+void print_dag_summary(
+    const char *indent, const DagTopologyMetrics &metrics,
+    std::uint64_t dependency_data_capacity_bytes)
+{
+  std::cout << indent << "Tasks: " << metrics.tasks << "\n"
+            << indent << "Dependency edges: "
+            << metrics.dependency_edges << "\n"
+            << indent << "Dependency-data capacity: "
+            << dependency_data_capacity_bytes << " bytes\n";
+  print_topology_metrics(indent, metrics);
+}
+
+void write_topology_metric_fields(
+    std::ostream &out, const DagTopologyMetrics &metrics)
+{
+  out << "\"tasks\":" << metrics.tasks
+      << ",\"dependency_edges\":" << metrics.dependency_edges
+      << ",\"critical_path_length\":"
+      << metrics.critical_path_length
+      << ",\"parallelism\":{\"average\":"
+      << metrics.average_parallelism << ",\"peak\":"
+      << metrics.peak_parallelism << ",\"p50\":"
+      << metrics.parallelism_p50 << ",\"p95\":"
+      << metrics.parallelism_p95 << ",\"cv\":"
+      << metrics.parallelism_cv << "}";
 }
 
 std::uint64_t checked_add(std::uint64_t lhs, std::uint64_t rhs,
@@ -197,10 +235,10 @@ std::uint64_t checked_multiply(std::uint64_t lhs, std::uint64_t rhs,
   return lhs * rhs;
 }
 
-struct WorkSummary {
+struct KernelWorkloadSummary {
   std::uint64_t total_iterations = 0;
-  std::uint64_t min_task_iterations = 0;
-  std::uint64_t max_task_iterations = 0;
+  std::uint64_t min_iterations_per_task = 0;
+  std::uint64_t max_iterations_per_task = 0;
   std::uint64_t scratch_window_bytes = 0;
   std::uint64_t scratch_read_bytes_per_iteration = 0;
   std::uint64_t scratch_write_bytes_per_iteration = 0;
@@ -208,25 +246,25 @@ struct WorkSummary {
   std::uint64_t total_scratch_write_bytes = 0;
 };
 
-WorkSummary summarize_work(
+KernelWorkloadSummary summarize_kernel_workload(
     const TaskGraph &task_graph,
     const TaskIterationCounts &task_iteration_counts)
 {
-  WorkSummary result;
+  KernelWorkloadSummary result;
   bool have_task = false;
   for (std::uint64_t iterations : task_iteration_counts) {
     result.total_iterations =
         checked_add(result.total_iterations, iterations,
                     "workload iteration count");
     if (!have_task) {
-      result.min_task_iterations = iterations;
+      result.min_iterations_per_task = iterations;
       have_task = true;
     } else {
-      result.min_task_iterations =
-          std::min(result.min_task_iterations, iterations);
+      result.min_iterations_per_task =
+          std::min(result.min_iterations_per_task, iterations);
     }
-    result.max_task_iterations =
-        std::max(result.max_task_iterations, iterations);
+    result.max_iterations_per_task =
+        std::max(result.max_iterations_per_task, iterations);
   }
 
   if (uses_task_scratch(task_graph)) {
@@ -248,46 +286,14 @@ WorkSummary summarize_work(
   return result;
 }
 
-std::uint64_t total_tasks(
+std::uint64_t total_dependency_data_capacity_bytes(
     const std::vector<ExpandedDag> &expanded_dags)
 {
   std::uint64_t result = 0;
   for (const ExpandedDag &expanded_dag : expanded_dags) {
-    result = checked_add(result, expanded_dag.tasks.size(),
-                         "task count");
-  }
-  return result;
-}
-
-std::uint64_t total_edges(
-    const std::vector<ExpandedDag> &expanded_dags)
-{
-  std::uint64_t result = 0;
-  for (const ExpandedDag &expanded_dag : expanded_dags) {
-    result = checked_add(result, expanded_dag.dependency_edges,
-                         "dependency edge count");
-  }
-  return result;
-}
-
-std::uint64_t total_task_data_accesses(
-    const std::vector<ExpandedDag> &expanded_dags)
-{
-  std::uint64_t result = 0;
-  for (const ExpandedDag &expanded_dag : expanded_dags) {
-    result = checked_add(result, expanded_dag.task_data_accesses,
-                         "task data access count");
-  }
-  return result;
-}
-
-std::uint64_t total_task_data_store_bytes(
-    const std::vector<ExpandedDag> &expanded_dags)
-{
-  std::uint64_t result = 0;
-  for (const ExpandedDag &expanded_dag : expanded_dags) {
-    result = checked_add(result, expanded_dag.task_data_store_bytes,
-                         "task data store byte count");
+    result = checked_add(
+        result, expanded_dag.dependency_data_capacity_bytes,
+        "dependency-data capacity");
   }
   return result;
 }
@@ -335,6 +341,36 @@ void validate_dag_results(
   }
 }
 
+void validate_topology_metrics(
+    const std::vector<ExpandedDag> &expanded_dags,
+    const TopologyMetrics &topology_metrics)
+{
+  if (topology_metrics.dags.size() != expanded_dags.size()) {
+    throw std::logic_error(
+        "topology metric count does not match DAG count");
+  }
+  std::uint64_t tasks = 0;
+  std::uint64_t edges = 0;
+  for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
+    const DagTopologyMetrics &metrics = topology_metrics.dags[i];
+    if (metrics.tasks != expanded_dags[i].tasks.size() ||
+        metrics.dependency_edges !=
+            expanded_dags[i].dependency_edges) {
+      throw std::logic_error(
+          "topology metrics do not match expanded DAG");
+    }
+    tasks = checked_add(tasks, metrics.tasks, "combined task count");
+    edges = checked_add(
+        edges, metrics.dependency_edges,
+        "combined dependency edge count");
+  }
+  if (topology_metrics.combined.tasks != tasks ||
+      topology_metrics.combined.dependency_edges != edges) {
+    throw std::logic_error(
+        "combined topology metrics do not match per-DAG metrics");
+  }
+}
+
 }  // namespace
 
 PerformanceSummary summarize_performance(
@@ -355,12 +391,14 @@ void print_report(const RunConfig &run_config,
                       &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                   const KernelResourcesByDag &kernel_resources,
+                  const TopologyMetrics &topology_metrics,
                   const std::string &execution_config_hash,
                   const std::vector<SampleResult> &samples)
 {
   validate_dag_results(
       expanded_dags, task_iteration_counts, gpu_kernel_configs,
       devices, kernel_resources);
+  validate_topology_metrics(expanded_dags, topology_metrics);
   const PerformanceSummary summary = summarize_performance(samples);
   std::cout << "CUDASTF Task Bench\n"
             << "  Context: " << run_config.context << "\n"
@@ -372,22 +410,36 @@ void print_report(const RunConfig &run_config,
     std::cout << devices[i].device_id << " (" << devices[i].name << ")";
   }
   std::cout << "\n"
-            << "  Placement: "
-            << placement_policy_name(run_config.placement.policy) << "\n"
-            << "  DAGs: " << expanded_dags.size() << "\n"
-            << "  Tasks: " << total_tasks(expanded_dags) << "\n"
-            << "  Dependency edges: " << total_edges(expanded_dags) << "\n"
-            << "  Task data accesses: "
-            << total_task_data_accesses(expanded_dags) << "\n"
-            << "  Task data store bytes: "
-            << total_task_data_store_bytes(expanded_dags) << "\n";
+            << "  Task placement: ";
+  if (devices.size() == 1) {
+    std::cout << "all tasks on device " << devices.front().device_id;
+  } else {
+    std::cout
+        << task_placement_policy_name(run_config.task_placement.policy)
+        << " ("
+        << task_placement_policy_description(
+               run_config.task_placement.policy)
+        << ")";
+  }
+  std::cout << "\n"
+            << "  DAGs: " << expanded_dags.size() << "\n";
+  if (expanded_dags.size() > 1) {
+    std::cout << "  Combined DAGs:\n";
+    print_dag_summary(
+        "    ", topology_metrics.combined,
+        total_dependency_data_capacity_bytes(expanded_dags));
+  }
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     const TaskGraph &task_graph = expanded_dags[i].task_graph;
     const GpuKernelConfig &gpu_kernel_config = gpu_kernel_configs[i];
-    const WorkSummary work =
-        summarize_work(task_graph, task_iteration_counts[i]);
-    std::cout << "  DAG " << i << ":\n"
-              << "    Kernel: "
+    const KernelWorkloadSummary kernel_workload =
+        summarize_kernel_workload(
+            task_graph, task_iteration_counts[i]);
+    std::cout << "  DAG " << i << ":\n";
+    print_dag_summary(
+        "    ", topology_metrics.dags[i],
+        expanded_dags[i].dependency_data_capacity_bytes);
+    std::cout << "    Kernel: "
               << kernel_name(task_graph.kernel.type);
     if (task_graph.kernel.type == KernelType::COMPUTE_BOUND) {
       std::cout << " ("
@@ -395,15 +447,24 @@ void print_report(const RunConfig &run_config,
                     gpu_kernel_config.compute_data_type)
                 << ")";
     }
-    std::cout << "\n"
-              << "    Work: base " << task_graph.kernel.iterations
-              << " iterations/task, imbalance "
-              << task_graph.kernel.imbalance
-              << ", effective "
-              << work.min_task_iterations << ".."
-              << work.max_task_iterations
-              << ", total " << work.total_iterations << "\n"
-              << "    Launch: "
+    std::cout << "\n";
+    if (task_graph.kernel.type != KernelType::EMPTY) {
+      std::cout << "    Kernel workload iterations: ";
+      if (task_graph.kernel.imbalance == 0.0) {
+        std::cout << task_graph.kernel.iterations << "/task";
+      } else {
+        std::cout << "configured " << task_graph.kernel.iterations
+                  << "/task, assigned "
+                  << kernel_workload.min_iterations_per_task << ".."
+                  << kernel_workload.max_iterations_per_task << "/task";
+      }
+      std::cout << ", total " << kernel_workload.total_iterations << "\n";
+      if (task_graph.kernel.imbalance != 0.0) {
+        std::cout << "    Iteration imbalance: "
+                  << task_graph.kernel.imbalance << "\n";
+      }
+    }
+    std::cout << "    Launch: "
               << gpu_kernel_config.launch.blocks_per_task
               << " blocks x "
               << gpu_kernel_config.launch.threads_per_block
@@ -426,15 +487,15 @@ void print_report(const RunConfig &run_config,
                 << task_graph.scratch_bytes_per_task
                 << " allocated bytes/task, "
                 << "sample window "
-                << work.scratch_window_bytes
+                << kernel_workload.scratch_window_bytes
                 << " bytes, read "
-                << work.scratch_read_bytes_per_iteration
+                << kernel_workload.scratch_read_bytes_per_iteration
                 << " and write "
-                << work.scratch_write_bytes_per_iteration
+                << kernel_workload.scratch_write_bytes_per_iteration
                 << " bytes/iteration, total reads "
-                << work.total_scratch_read_bytes
+                << kernel_workload.total_scratch_read_bytes
                 << " bytes, total writes "
-                << work.total_scratch_write_bytes << " bytes\n";
+                << kernel_workload.total_scratch_write_bytes << " bytes\n";
     }
   }
   std::cout << "  Execution config hash: "
@@ -448,27 +509,27 @@ void print_report(const RunConfig &run_config,
             << " ms\n";
 }
 
-void write_json(const std::string &path, const RunConfig &run_config,
-                const std::vector<CudaDeviceInfo> &devices,
-                const std::vector<std::string> &core_arguments,
-                const std::vector<ExpandedDag> &expanded_dags,
-                const std::vector<TaskIterationCounts>
-                    &task_iteration_counts,
-                const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                const KernelResourcesByDag &kernel_resources,
-                const std::string &execution_config_hash,
-                const std::vector<SampleResult> &samples)
+void write_run_json(
+    const std::string &path, const RunConfig &run_config,
+    const std::vector<CudaDeviceInfo> &devices,
+    const std::vector<std::string> &core_arguments,
+    const std::vector<ExpandedDag> &expanded_dags,
+    const std::vector<TaskIterationCounts> &task_iteration_counts,
+    const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+    const KernelResourcesByDag &kernel_resources,
+    const std::string &execution_config_hash,
+    const std::vector<SampleResult> &samples)
 {
   validate_dag_results(
       expanded_dags, task_iteration_counts, gpu_kernel_configs,
       devices, kernel_resources);
   std::ofstream out(path);
   if (!out) {
-    throw std::runtime_error("failed to open JSON output: " + path);
+    throw std::runtime_error("failed to open run JSON output: " + path);
   }
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
-      << "  \"format\":\"cudastf-task-bench-results\",\n"
+      << "  \"format\":\"cudastf-task-bench-run\",\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION) << "\",\n"
@@ -511,12 +572,12 @@ void write_json(const std::string &path, const RunConfig &run_config,
   out << "],\n"
       << "  \"run_config\":{\"device_ids\":[";
   for (std::size_t i = 0;
-       i < run_config.placement.devices.size(); ++i) {
+       i < run_config.task_placement.devices.size(); ++i) {
     if (i != 0) out << ",";
-    out << run_config.placement.devices[i];
+    out << run_config.task_placement.devices[i];
   }
-  out << "],\"placement\":\""
-      << placement_policy_name(run_config.placement.policy)
+  out << "],\"task_placement\":\""
+      << task_placement_policy_name(run_config.task_placement.policy)
       << "\",\"context\":\"" << json_escape(run_config.context)
       << "\",\"logical_data_allocator\":\""
       << json_escape(run_config.logical_data_allocator)
@@ -531,8 +592,6 @@ void write_json(const std::string &path, const RunConfig &run_config,
     const ExpandedDag &expanded_dag = expanded_dags[i];
     const TaskGraph &task_graph = expanded_dag.task_graph;
     const GpuKernelConfig &gpu_kernel_config = gpu_kernel_configs[i];
-    const WorkSummary work =
-        summarize_work(task_graph, task_iteration_counts[i]);
     out << "    {\"dag_index\":" << expanded_dag.dag_index()
         << ",\"timesteps\":" << task_graph.timesteps
         << ",\"max_width\":" << task_graph.max_width
@@ -577,56 +636,70 @@ void write_json(const std::string &path, const RunConfig &run_config,
           << ",\"max_active_blocks_per_sm\":"
           << resources.max_active_blocks_per_sm << "}";
     }
-    out << "],\"work_summary\":{\"total_iterations\":"
-        << work.total_iterations
-        << ",\"min_task_iterations\":"
-        << work.min_task_iterations
-        << ",\"max_task_iterations\":"
-        << work.max_task_iterations
-        << ",\"scratch_window_bytes\":"
-        << work.scratch_window_bytes
-        << ",\"scratch_read_bytes_per_iteration\":"
-        << work.scratch_read_bytes_per_iteration
-        << ",\"scratch_write_bytes_per_iteration\":"
-        << work.scratch_write_bytes_per_iteration
-        << ",\"total_scratch_read_bytes\":"
-        << work.total_scratch_read_bytes
-        << ",\"total_scratch_write_bytes\":"
-        << work.total_scratch_write_bytes
-        << "}}"
+    out << "]}"
         << ",\"topology_hash\":\"" << expanded_dag.topology_hash
         << "\",\"tasks\":" << expanded_dag.tasks.size()
         << ",\"dependency_edges\":"
-        << expanded_dag.dependency_edges
-        << ",\"task_data_accesses\":"
-        << expanded_dag.task_data_accesses
-        << ",\"task_data_store_bytes\":"
-        << expanded_dag.task_data_store_bytes
-        << "}";
+        << expanded_dag.dependency_edges << "}";
     out << (i + 1 == expanded_dags.size() ? "\n" : ",\n");
   }
   out << "  ],\n"
-      << "  \"aggregate_counts\":{\"tasks\":"
-      << total_tasks(expanded_dags) << ",\"dependency_edges\":"
-      << total_edges(expanded_dags) << ",\"task_data_accesses\":"
-      << total_task_data_accesses(expanded_dags)
-      << ",\"task_data_store_bytes\":"
-      << total_task_data_store_bytes(expanded_dags) << "},\n"
       << "  \"samples\":[";
   for (std::size_t i = 0; i < samples.size(); ++i) {
     if (i != 0) out << ",";
     write_sample(out, samples[i]);
   }
-  const PerformanceSummary summary = summarize_performance(samples);
-  out << "],\n  \"summary\":{\"min\":";
-  write_performance_metrics(out, summary.minimum);
-  out << ",\"median\":";
-  write_performance_metrics(out, summary.median);
-  out << ",\"p95\":";
-  write_performance_metrics(out, summary.p95);
-  out << "}\n}\n";
+  out << "]\n}\n";
 
   if (!out) {
-    throw std::runtime_error("failed while writing JSON output: " + path);
+    throw std::runtime_error(
+        "failed while writing run JSON output: " + path);
+  }
+}
+
+void write_analysis_json(
+    const std::string &path,
+    const std::vector<ExpandedDag> &expanded_dags,
+    const TopologyMetrics &topology_metrics,
+    const std::string &execution_config_hash)
+{
+  validate_topology_metrics(expanded_dags, topology_metrics);
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error(
+        "failed to open analysis JSON output: " + path);
+  }
+
+  out << std::setprecision(std::numeric_limits<double>::max_digits10);
+  out << "{\n"
+      << "  \"format\":\"cudastf-task-bench-analysis\",\n"
+      << "  \"backend\":\"cudastf\",\n"
+      << "  \"source\":{\"task_bench_revision\":\""
+      << json_escape(TASKBENCH_REVISION)
+      << "\",\"task_bench_worktree_dirty\":"
+      << (TASKBENCH_WORKTREE_DIRTY ? "true" : "false")
+      << ",\"execution_config_hash\":\""
+      << execution_config_hash << "\",\"dags\":[";
+  for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
+    if (i != 0) out << ",";
+    out << "{\"dag_index\":" << expanded_dags[i].dag_index()
+        << ",\"topology_hash\":\""
+        << expanded_dags[i].topology_hash << "\"}";
+  }
+  out << "]},\n"
+      << "  \"topology\":{\"dags\":[";
+  for (std::size_t i = 0; i < topology_metrics.dags.size(); ++i) {
+    if (i != 0) out << ",";
+    out << "{\"dag_index\":" << expanded_dags[i].dag_index() << ",";
+    write_topology_metric_fields(out, topology_metrics.dags[i]);
+    out << "}";
+  }
+  out << "],\"combined\":{";
+  write_topology_metric_fields(out, topology_metrics.combined);
+  out << "}}\n}\n";
+
+  if (!out) {
+    throw std::runtime_error(
+        "failed while writing analysis JSON output: " + path);
   }
 }

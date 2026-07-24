@@ -139,17 +139,18 @@ std::string compute_execution_config_hash(
   hash.add_string("cudastf-execution-config");
   hash.add_string(run_config.context);
   hash.add_string(run_config.logical_data_allocator);
-  if (run_config.placement.devices.empty()) {
+  if (run_config.task_placement.devices.empty()) {
     throw std::logic_error("execution configuration has no CUDA devices");
   }
-  hash.add_i64(run_config.placement.devices.front());
-  if (run_config.placement.devices.size() > 1) {
+  hash.add_i64(run_config.task_placement.devices.front());
+  if (run_config.task_placement.devices.size() > 1) {
     hash.add_string("multi-gpu-placement");
-    hash.add_u64(run_config.placement.devices.size());
-    for (int device : run_config.placement.devices) {
+    hash.add_u64(run_config.task_placement.devices.size());
+    for (int device : run_config.task_placement.devices) {
       hash.add_i64(device);
     }
-    hash.add_string(placement_policy_name(run_config.placement.policy));
+    hash.add_string(task_placement_policy_name(
+        run_config.task_placement.policy));
   }
   hash.add_u64(expanded_dags.size());
 

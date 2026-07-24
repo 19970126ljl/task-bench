@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "placement.h"
+#include "task_placement.h"
 
 struct GpuKernelLaunchConfig {
   int blocks_per_task = 32;
@@ -24,16 +24,21 @@ struct GpuKernelConfig {
 };
 
 struct RunConfig {
-  TaskPlacement placement;
+  TaskPlacement task_placement;
   int warmup_samples = 1;
   int measured_samples = 5;
   std::string context = "stream";
   std::string logical_data_allocator = "cached";
-  std::string json_path;
+};
+
+struct OutputConfig {
+  std::string run_json_path;
+  std::string analysis_json_path;
 };
 
 struct Arguments {
   RunConfig run;
+  OutputConfig output;
   std::vector<GpuKernelConfig> gpu_kernel_configs;
   std::vector<std::string> core_arguments;
   bool help_requested = false;

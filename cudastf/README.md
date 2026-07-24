@@ -29,7 +29,7 @@ also be overridden.
   -cuda-compute-dtype fp32 \
   -cuda-devices 0,1 -cuda-placement block \
   -cuda-warmup 1 -cuda-runs 5 \
-  -cuda-json result.json
+  -cuda-json run.json -cuda-analysis-json analysis.json
 ```
 
 CUDASTF options:
@@ -42,6 +42,7 @@ CUDASTF options:
 -cuda-warmup N
 -cuda-runs N
 -cuda-json FILE
+-cuda-analysis-json FILE
 -cuda-blocks-per-task N
 -cuda-threads-per-block N
 -cuda-shmem-bytes-per-block N
@@ -50,8 +51,9 @@ CUDASTF options:
 
 Run `./cudastf/task_bench -h` for Task Bench options and current defaults.
 Launch options and compute data type apply to the current DAG and reset after
-`-and`; device placement and sampling options are global. The singular and
-plural device options cannot be combined, and the default is GPU 0.
+`-and`; task placement and sampling options are global. `block` assigns
+contiguous point ranges and `cyclic` assigns points round-robin. The singular
+and plural device options cannot be combined, and the default is GPU 0.
 `CUDASTF_DEFAULT_ALLOCATOR`
 selects `cached`, `cached_fifo`, `uncached`, or `pooled` and defaults to
 `cached`.
@@ -85,8 +87,9 @@ submission and data ownership are defined in [`main.cu`](main.cu).
 
 ## Results
 
-Console and JSON output include DAG counts, requested workload, kernel resource
-use, launch residency limits, submission time, and DAG makespan.
+Console output includes execution timing and derived topology metrics.
+`-cuda-json` records configuration, environment, identities, and raw samples;
+`-cuda-analysis-json` writes derived analysis separately.
 
 `DAG makespan` is the CUDA event interval from the synchronized boundary before
 submission to the final CUDASTF fence. JSON field definitions are emitted by

@@ -10,7 +10,8 @@
 
 namespace {
 
-std::size_t checked_task_data_store_bytes(const TaskGraph &task_graph)
+std::size_t checked_dependency_data_capacity_bytes(
+    const TaskGraph &task_graph)
 {
   const std::uint64_t fields =
       static_cast<std::uint64_t>(task_graph.nb_fields);
@@ -21,11 +22,13 @@ std::size_t checked_task_data_store_bytes(const TaskGraph &task_graph)
   const std::uint64_t limit = std::numeric_limits<std::size_t>::max();
 
   if (fields != 0 && width > limit / fields) {
-    throw std::runtime_error("task data store size overflows size_t");
+    throw std::runtime_error(
+        "dependency-data capacity overflows size_t");
   }
   const std::uint64_t slots = fields * width;
   if (slots != 0 && bytes > limit / slots) {
-    throw std::runtime_error("task data store size overflows size_t");
+    throw std::runtime_error(
+        "dependency-data capacity overflows size_t");
   }
   return static_cast<std::size_t>(slots * bytes);
 }
@@ -97,8 +100,8 @@ std::vector<ExpandedDag> expand_task_graphs(const App &task_bench_app)
 
     ExpandedDag expanded_dag;
     expanded_dag.task_graph = task_graph;
-    expanded_dag.task_data_store_bytes =
-        checked_task_data_store_bytes(task_graph);
+    expanded_dag.dependency_data_capacity_bytes =
+        checked_dependency_data_capacity_bytes(task_graph);
 
     for (long timestep = 0; timestep < task_graph.timesteps; ++timestep) {
       const long offset = task_graph.offset_at_timestep(timestep);
@@ -173,14 +176,6 @@ std::vector<ExpandedDag> expand_task_graphs(const App &task_bench_app)
       }
     }
 
-    if (expanded_dag.tasks.size() >
-        std::numeric_limits<std::uint64_t>::max() -
-            expanded_dag.dependency_edges) {
-      throw std::runtime_error(
-          "task data access count overflows uint64_t");
-    }
-    expanded_dag.task_data_accesses =
-        expanded_dag.tasks.size() + expanded_dag.dependency_edges;
     expanded_dag.topology_hash =
         compute_topology_hash(expanded_dag.tasks);
     expanded_dags.push_back(std::move(expanded_dag));

@@ -105,10 +105,11 @@ std::vector<int> parse_device_list(const char *flag, const char *text)
   return devices;
 }
 
-PlacementPolicy parse_placement_policy(const char *flag, const char *text)
+TaskPlacementPolicy parse_task_placement_policy(
+    const char *flag, const char *text)
 {
-  if (!std::strcmp(text, "block")) return PlacementPolicy::block;
-  if (!std::strcmp(text, "cyclic")) return PlacementPolicy::cyclic;
+  if (!std::strcmp(text, "block")) return TaskPlacementPolicy::block;
+  if (!std::strcmp(text, "cyclic")) return TaskPlacementPolicy::cyclic;
   throw std::runtime_error(std::string("invalid value for ") + flag +
                            ": " + text + "; expected block or cyclic");
 }
@@ -159,7 +160,7 @@ Arguments parse_arguments(int argc, char **argv)
             "-cuda-device and -cuda-devices cannot be used together");
       }
       single_device_option_seen = true;
-      arguments.run.placement.devices = {
+      arguments.run.task_placement.devices = {
           parse_nonnegative_int(arg, require_value(i, argc, argv))};
     } else if (!std::strcmp(arg, "-cuda-devices")) {
       if (single_device_option_seen) {
@@ -167,10 +168,10 @@ Arguments parse_arguments(int argc, char **argv)
             "-cuda-device and -cuda-devices cannot be used together");
       }
       device_list_option_seen = true;
-      arguments.run.placement.devices =
+      arguments.run.task_placement.devices =
           parse_device_list(arg, require_value(i, argc, argv));
     } else if (!std::strcmp(arg, "-cuda-placement")) {
-      arguments.run.placement.policy = parse_placement_policy(
+      arguments.run.task_placement.policy = parse_task_placement_policy(
           arg, require_value(i, argc, argv));
     } else if (!std::strcmp(arg, "-cuda-warmup")) {
       arguments.run.warmup_samples =
@@ -184,9 +185,16 @@ Arguments parse_arguments(int argc, char **argv)
     } else if (!std::strcmp(arg, "-cuda-context")) {
       arguments.run.context = require_value(i, argc, argv);
     } else if (!std::strcmp(arg, "-cuda-json")) {
-      arguments.run.json_path = require_value(i, argc, argv);
-      if (arguments.run.json_path.empty()) {
+      arguments.output.run_json_path = require_value(i, argc, argv);
+      if (arguments.output.run_json_path.empty()) {
         throw std::runtime_error("-cuda-json requires a non-empty path");
+      }
+    } else if (!std::strcmp(arg, "-cuda-analysis-json")) {
+      arguments.output.analysis_json_path =
+          require_value(i, argc, argv);
+      if (arguments.output.analysis_json_path.empty()) {
+        throw std::runtime_error(
+            "-cuda-analysis-json requires a non-empty path");
       }
     } else if (!std::strcmp(arg, "-cuda-blocks-per-task")) {
       gpu_kernel_config.launch.blocks_per_task =
@@ -219,6 +227,12 @@ Arguments parse_arguments(int argc, char **argv)
                              arguments.run.context +
                              "'; only the stream executor is implemented");
   }
+  if (!arguments.output.run_json_path.empty() &&
+      arguments.output.run_json_path ==
+          arguments.output.analysis_json_path) {
+    throw std::runtime_error(
+        "-cuda-json and -cuda-analysis-json require different paths");
+  }
   return arguments;
 }
 
@@ -239,7 +253,7 @@ void print_backend_help()
   std::printf("  %-24s CUDA device id (default: 0)\n", "-cuda-device [INT]");
   std::printf("  %-24s ordered CUDA device ids\n",
               "-cuda-devices [LIST]");
-  std::printf("  %-24s task placement (default: block)\n",
+  std::printf("  %-24s task-to-device placement by point (default: block)\n",
               "-cuda-placement [block|cyclic]");
   std::printf("  %-24s context mode (currently: stream)\n",
               "-cuda-context [MODE]");
@@ -247,8 +261,10 @@ void print_backend_help()
               "-cuda-warmup [INT]");
   std::printf("  %-24s number of measured samples (default: 5)\n",
               "-cuda-runs [INT]");
-  std::printf("  %-24s write machine-readable results\n",
+  std::printf("  %-24s write raw run record\n",
               "-cuda-json [FILE]");
+  std::printf("  %-24s write derived analysis\n",
+              "-cuda-analysis-json [FILE]");
   std::printf("  %-36s blocks launched by each task (default: 32)\n",
               "-cuda-blocks-per-task [INT]");
   std::printf("  %-36s threads in each block (default: 128)\n",

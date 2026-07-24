@@ -1,4 +1,4 @@
-#include "placement.h"
+#include "task_placement.h"
 
 #include <cstdint>
 #include <limits>
@@ -28,7 +28,7 @@ int TaskPlacement::device_for(
       static_cast<std::uint64_t>(devices.size());
   std::uint64_t index = 0;
   switch (policy) {
-  case PlacementPolicy::block:
+  case TaskPlacementPolicy::block:
     if (point != 0 &&
         device_count >
             std::numeric_limits<std::uint64_t>::max() / point) {
@@ -36,20 +36,31 @@ int TaskPlacement::device_for(
     }
     index = point * device_count / width;
     break;
-  case PlacementPolicy::cyclic:
+  case TaskPlacementPolicy::cyclic:
     index = point % device_count;
     break;
   }
   return devices.at(static_cast<std::size_t>(index));
 }
 
-const char *placement_policy_name(PlacementPolicy policy)
+const char *task_placement_policy_name(TaskPlacementPolicy policy)
 {
   switch (policy) {
-  case PlacementPolicy::block:
+  case TaskPlacementPolicy::block:
     return "block";
-  case PlacementPolicy::cyclic:
+  case TaskPlacementPolicy::cyclic:
     return "cyclic";
   }
-  throw std::logic_error("unknown placement policy");
+  throw std::logic_error("unknown task placement policy");
+}
+
+const char *task_placement_policy_description(TaskPlacementPolicy policy)
+{
+  switch (policy) {
+  case TaskPlacementPolicy::block:
+    return "contiguous point ranges";
+  case TaskPlacementPolicy::cyclic:
+    return "round-robin by point";
+  }
+  throw std::logic_error("unknown task placement policy");
 }
