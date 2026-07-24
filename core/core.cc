@@ -710,8 +710,9 @@ static void show_help_message(int argc, char **argv)
   printf("  %-18s show this help message and exit\n", "-h");
   printf("  %-18s number of nodes to use for estimating transfer statistics\n",
          NODES_FLAG);
-  printf("  %-18s enable verbose output\n", "-v");
-  printf("  %-18s enable extra verbose output\n", "-vv");
+  printf("  %-18s show normalized configuration\n", "-v");
+  printf("  %-18s add compact timestep summaries\n", "-vv");
+  printf("  %-18s add full point dependency details\n", "-vvv");
 
   printf("\nOptions for configuring the task graph:\n");
   printf("  %-18s height of task graph\n", STEPS_FLAG " [INT]");
@@ -787,6 +788,10 @@ App::App(int argc, char **argv)
 
     if (!strcmp(argv[i], "-vv")) {
       verbose += 2;
+    }
+
+    if (!strcmp(argv[i], "-vvv")) {
+      verbose += 3;
     }
 
     if (!strcmp(argv[i], SKIP_GRAPH_VALIDATION_FLAG)) {
@@ -988,6 +993,31 @@ void App::check() const
 
   // Validate task graph is well-formed
   for (auto g : graphs) {
+    if (g.dependence == DependenceType::RANDOM_SPREAD) {
+      fprintf(stderr,
+              "error: Graph type \"random_spread\" is not implemented\n");
+      exit(EXIT_FAILURE);
+    }
+    if (g.dependence == DependenceType::FFT && g.max_width < 2) {
+      fprintf(stderr,
+              "error: Graph type \"fft\" requires a width of at least 2\n");
+      exit(EXIT_FAILURE);
+    }
+    if (g.dependence == DependenceType::STENCIL_1D_PERIODIC &&
+        g.max_width < 3) {
+      fprintf(stderr,
+              "error: Graph type \"stencil_1d_periodic\" requires a width "
+              "of at least 3\n");
+      exit(EXIT_FAILURE);
+    }
+    if (g.dependence == DependenceType::SPREAD &&
+        (g.radix <= 0 || g.radix > g.max_width)) {
+      fprintf(stderr,
+              "error: Graph type \"spread\" requires radix in [1, %ld]\n",
+              g.max_width);
+      exit(EXIT_FAILURE);
+    }
+
     if (needs_period(g.dependence) && g.period == 0) {
       fprintf(stderr,
               "error: Graph type \"%s\" requires a non-zero period (specify "
@@ -1003,13 +1033,16 @@ void App::check() const
     }
 
     // This is required to avoid wrapping around with later dependence sets.
-    long spread = (g.max_width + g.radix - 1) / g.radix;
-    if (g.dependence == DependenceType::SPREAD && g.period > spread) {
-      fprintf(
-          stderr,
-          "error: Graph type \"%s\" requires a period that is at most %ld\n",
-          name_by_dtype.at(g.dependence).c_str(), spread);
-      abort();
+    if (g.dependence == DependenceType::SPREAD) {
+      // g.radix was validated above, so this division is well-defined.
+      long spread = (g.max_width + g.radix - 1) / g.radix;
+      if (g.period > spread) {
+        fprintf(
+            stderr,
+            "error: Graph type \"%s\" requires a period that is at most %ld\n",
+            name_by_dtype.at(g.dependence).c_str(), spread);
+        abort();
+      }
     }
 
     for (long t = 0; t < g.timesteps; ++t) {
@@ -1047,77 +1080,212 @@ void App::check() const
   }
 }
 
+static void print_point_range(long offset, long width)
+{
+  if (width == 0) {
+    printf("none");
+  } else if (width == 1) {
+    printf("%ld", offset);
+  } else {
+    printf("%ld..%ld", offset, offset + width - 1);
+  }
+}
+
+static size_t count_point_dependencies(const TaskGraph &task_graph,
+                                       long dependence_set, long point,
+                                       long previous_offset,
+                                       long previous_width)
+{
+  size_t count = 0;
+  const long previous_end = previous_offset + previous_width;
+  for (auto dependency : task_graph.dependencies(dependence_set, point)) {
+    const long first = std::max(dependency.first, previous_offset);
+    const long last = std::min(dependency.second, previous_end - 1);
+    if (first <= last) {
+      count += static_cast<size_t>(last - first + 1);
+    }
+  }
+  return count;
+}
+
+static void print_dependency_ranges(const TaskGraph &task_graph,
+                                    long dependence_set, long point,
+                                    long previous_offset,
+                                    long previous_width)
+{
+  const long previous_end = previous_offset + previous_width;
+  bool first_range = true;
+  for (auto dependency : task_graph.dependencies(dependence_set, point)) {
+    const long first = std::max(dependency.first, previous_offset);
+    const long last = std::min(dependency.second, previous_end - 1);
+    if (first > last) {
+      continue;
+    }
+    if (!first_range) {
+      printf(",");
+    }
+    if (first == last) {
+      printf("%ld", first);
+    } else {
+      printf("%ld..%ld", first, last);
+    }
+    first_range = false;
+  }
+  if (first_range) {
+    printf("none");
+  }
+}
+
+static void print_compact_timestep(const TaskGraph &task_graph,
+                                   long timestep)
+{
+  const long offset = task_graph.offset_at_timestep(timestep);
+  const long width = task_graph.width_at_timestep(timestep);
+  const long previous_offset =
+      task_graph.offset_at_timestep(timestep - 1);
+  const long previous_width =
+      task_graph.width_at_timestep(timestep - 1);
+  const long dependence_set =
+      task_graph.dependence_set_at_timestep(timestep);
+
+  size_t edges = 0;
+  size_t min_fanin = 0;
+  size_t max_fanin = 0;
+  for (long point = offset; point < offset + width; ++point) {
+    const size_t fanin =
+        count_point_dependencies(task_graph, dependence_set, point,
+                                 previous_offset, previous_width);
+    edges += fanin;
+    if (point == offset || fanin < min_fanin) {
+      min_fanin = fanin;
+    }
+    max_fanin = std::max(max_fanin, fanin);
+  }
+
+  printf("      Timestep %ld: points ", timestep);
+  print_point_range(offset, width);
+  printf(" (%ld), previous ", width);
+  print_point_range(previous_offset, previous_width);
+  printf(" (%ld)\n", previous_width);
+  printf("        %zu dependency edges; fan-in ", edges);
+  if (min_fanin == max_fanin) {
+    printf("%zu", min_fanin);
+  } else {
+    printf("%zu..%zu", min_fanin, max_fanin);
+  }
+
+  if (width == 0 || edges == 0) {
+    printf("\n");
+    return;
+  }
+
+  printf("; examples: ");
+  const long example_count = std::min(width, 3L);
+  for (long i = 0; i < example_count; ++i) {
+    if (i != 0) {
+      printf("; ");
+    }
+    const long point = offset + i;
+    printf("%ld <- ", point);
+    print_dependency_ranges(task_graph, dependence_set, point,
+                            previous_offset, previous_width);
+  }
+  if (width > example_count) {
+    const long point = offset + width - 1;
+    printf("; ...; %ld <- ", point);
+    print_dependency_ranges(task_graph, dependence_set, point,
+                            previous_offset, previous_width);
+  }
+  printf("\n");
+}
+
 void App::display() const
 {
   printf("Running Task Benchmark\n");
   printf("  Configuration:\n");
   int i = 0;
-  for (auto g : graphs) {
+  for (const TaskGraph &task_graph : graphs) {
     ++i;
 
     printf("    Task Graph %d:\n", i);
-    printf("      Time Steps: %ld\n", g.timesteps);
-    printf("      Max Width: %ld\n", g.max_width);
+    printf("      Time Steps: %ld\n", task_graph.timesteps);
+    printf("      Max Width: %ld\n", task_graph.max_width);
     printf("      Dependence Type: %s\n",
-           name_by_dtype.at(g.dependence).c_str());
-    printf("      Radix: %ld\n", g.radix);
-    printf("      Period: %ld\n", g.period);
-    printf("      Fraction Connected: %f\n", g.fraction_connected);
+           name_by_dtype.at(task_graph.dependence).c_str());
+    printf("      Radix: %ld\n", task_graph.radix);
+    printf("      Period: %ld\n", task_graph.period);
+    printf("      Fraction Connected: %f\n",
+           task_graph.fraction_connected);
     printf("      Kernel:\n");
-    printf("        Type: %s\n", name_by_ktype.at(g.kernel.type).c_str());
-    printf("        Iterations: %ld\n", g.kernel.iterations);
-    printf("        Samples: %d\n", g.kernel.samples);
-    printf("        Imbalance: %f\n", g.kernel.imbalance);
-    printf("      Output Bytes: %lu\n", g.output_bytes_per_task);
-    printf("      Scratch Bytes: %lu\n", g.scratch_bytes_per_task);
+    printf("        Type: %s\n",
+           name_by_ktype.at(task_graph.kernel.type).c_str());
+    printf("        Iterations: %ld\n", task_graph.kernel.iterations);
+    printf("        Samples: %d\n", task_graph.kernel.samples);
+    printf("        Imbalance: %f\n", task_graph.kernel.imbalance);
+    printf("      Output Bytes: %lu\n",
+           task_graph.output_bytes_per_task);
+    printf("      Scratch Bytes: %lu\n",
+           task_graph.scratch_bytes_per_task);
 
-    if (verbose > 0) {
-      for (long t = 0; t < g.timesteps; ++t) {
-        long offset = g.offset_at_timestep(t);
-        long width = g.width_at_timestep(t);
+    if (verbose == 2) {
+      for (long timestep = 0; timestep < task_graph.timesteps; ++timestep) {
+        print_compact_timestep(task_graph, timestep);
+      }
+    } else if (verbose > 2) {
+      for (long timestep = 0; timestep < task_graph.timesteps; ++timestep) {
+        long offset = task_graph.offset_at_timestep(timestep);
+        long width = task_graph.width_at_timestep(timestep);
 
-        long last_offset = g.offset_at_timestep(t - 1);
-        long last_width = g.width_at_timestep(t - 1);
+        long last_offset = task_graph.offset_at_timestep(timestep - 1);
+        long last_width = task_graph.width_at_timestep(timestep - 1);
 
-        long dset = g.dependence_set_at_timestep(t);
+        long dependence_set =
+            task_graph.dependence_set_at_timestep(timestep);
 
         printf(
             "      Timestep %ld (offset %ld, width %ld, last offset %ld, last "
             "width %ld):\n",
-            t, offset, width, last_offset, last_width);
+            timestep, offset, width, last_offset, last_width);
         printf("        Points:");
-        for (long p = offset; p < offset + width; ++p) {
-          printf(" %ld", p);
+        for (long point = offset; point < offset + width; ++point) {
+          printf(" %ld", point);
         }
         printf("\n");
 
         printf("        Dependencies:\n");
-        for (long p = offset; p < offset + width; ++p) {
-          printf("          Point %ld:", p);
-          auto deps = g.dependencies(dset, p);
-          for (auto dep : deps) {
-            for (long dp = dep.first; dp <= dep.second; ++dp) {
-              if (dp >= last_offset && dp < last_offset + last_width) {
-                printf(" %ld", dp);
+        for (long point = offset; point < offset + width; ++point) {
+          printf("          Point %ld:", point);
+          auto dependencies =
+              task_graph.dependencies(dependence_set, point);
+          for (auto dependency : dependencies) {
+            for (long predecessor_point = dependency.first;
+                 predecessor_point <= dependency.second;
+                 ++predecessor_point) {
+              if (predecessor_point >= last_offset &&
+                  predecessor_point < last_offset + last_width) {
+                printf(" %ld", predecessor_point);
               }
             }
           }
           printf("\n");
         }
-        if (verbose > 1) {
-          printf("        Reverse Dependencies:\n");
-          for (long p = last_offset; p < last_offset + last_width; ++p) {
-            printf("          Point %ld:", p);
-            auto deps = g.reverse_dependencies(dset, p);
-            for (auto dep : deps) {
-              for (long dp = dep.first; dp <= dep.second; ++dp) {
-                if (dp >= offset && dp < offset + width) {
-                  printf(" %ld", dp);
-                }
+        printf("        Reverse Dependencies:\n");
+        for (long point = last_offset;
+             point < last_offset + last_width; ++point) {
+          printf("          Point %ld:", point);
+          auto reverse_dependencies =
+              task_graph.reverse_dependencies(dependence_set, point);
+          for (auto reverse_dependency : reverse_dependencies) {
+            for (long successor_point = reverse_dependency.first;
+                 successor_point <= reverse_dependency.second;
+                 ++successor_point) {
+              if (successor_point >= offset &&
+                  successor_point < offset + width) {
+                printf(" %ld", successor_point);
               }
             }
-            printf("\n");
           }
+          printf("\n");
         }
       }
     }
