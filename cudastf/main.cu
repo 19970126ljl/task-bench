@@ -1,4 +1,5 @@
 #include <cuda/experimental/stf.cuh>
+#include <cuda/experimental/stf_cupti.cuh>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -23,6 +25,7 @@
 #include "expanded_dag.h"
 #include "identity.h"
 #include "results.h"
+#include "derived_metrics.h"
 #include "topology.h"
 #include "workload.cuh"
 
@@ -30,6 +33,9 @@ using cuda::experimental::stf::exec_place;
 using cuda::experimental::stf::logical_data;
 using cuda::experimental::stf::slice;
 using cuda::experimental::stf::stream_ctx;
+using cuda::experimental::stf::cupti_task_profiler;
+using cuda::experimental::stf::task_activity_profile;
+using cuda::experimental::stf::task_serialization;
 
 namespace {
 
@@ -426,7 +432,9 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
                 const TaskIterationCounts &task_iteration_counts,
                 const GpuKernelConfig &gpu_kernel_config,
                 DependencyDataStore &dependency_data_store,
-                const TaskPlacement &task_placement)
+                const TaskPlacement &task_placement,
+                std::uint64_t profile_context_id,
+                ExpectedProfileTasks *expected_profile_tasks)
 {
   if (task_iteration_counts.size() != expanded_dag.tasks.size()) {
     throw std::logic_error(
@@ -443,6 +451,21 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
     const int device_id = task_placement.device_for(
         expanded_dag.task_graph, dag_task.coordinates);
     auto stf_task = ctx.task(exec_place::device(device_id));
+    const std::string task_symbol = make_task_symbol(
+        gpu_workload_name(expanded_dag.task_graph.kernel.type),
+        dag_task.coordinates);
+    if (expected_profile_tasks != nullptr) {
+      const RuntimeProfileKey runtime_key{
+          profile_context_id, stf_task.get_unique_id()};
+      const ExpectedProfileTask expected{
+          {dag_task.coordinates.dag_index,
+           dag_task.coordinates.timestep,
+           dag_task.coordinates.point},
+          device_id, task_symbol};
+      if (!expected_profile_tasks->emplace(runtime_key, expected).second) {
+        throw std::logic_error("duplicate CUDASTF profiler task id");
+      }
+    }
     stf_task.add_deps(
         dependency_data_store.at(output_access.data).write());
 
@@ -464,10 +487,7 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
       scratch->set_symbol(make_scratch_symbol(dag_task.coordinates));
       stf_task.add_deps(scratch->write());
     }
-    stf_task.set_symbol(
-        make_task_symbol(
-            gpu_workload_name(expanded_dag.task_graph.kernel.type),
-            dag_task.coordinates));
+    stf_task.set_symbol(task_symbol);
     attach_gpu_workload(
         stf_task, dag_task, expanded_dag.task_graph,
         task_iteration_counts[task_index],
@@ -475,12 +495,69 @@ void submit_dag(stream_ctx &ctx, const ExpandedDag &expanded_dag,
   }
 }
 
+TaskActivitySample copy_task_activity_profile(
+    const task_activity_profile &profile)
+{
+  TaskActivitySample result;
+  result.cupti_timestamp_origin_ns = profile.cupti_timestamp_origin_ns;
+  result.contexts.reserve(profile.contexts.size());
+  for (const auto &context : profile.contexts) {
+    const CudaFeatureState serialization =
+        context.serialization == task_serialization::enabled
+            ? CudaFeatureState::enabled
+            : CudaFeatureState::disabled;
+    TaskProfileContext converted;
+    converted.context_id = context.context_id;
+    converted.label = context.label;
+    converted.has_gpu_activity = context.has_gpu_activity;
+    converted.start_ns = context.start_ns;
+    converted.end_ns = context.end_ns;
+    converted.elapsed_ms = context.elapsed_ms;
+    converted.task_count = context.task_count;
+    converted.operation_count = context.operation_count;
+    converted.task_serialization = serialization;
+    converted.regions.reserve(context.regions.size());
+    for (const auto &region : context.regions) {
+      converted.regions.push_back(
+          {region.region_id, region.label, region.has_gpu_activity,
+           region.start_ns, region.end_ns, region.elapsed_ms,
+           static_cast<std::uint64_t>(region.task_count),
+           static_cast<std::uint64_t>(region.operation_count)});
+    }
+    result.contexts.push_back(std::move(converted));
+  }
+  result.tasks.reserve(profile.tasks.size());
+  for (const auto &task : profile.tasks) {
+    TaskActivityRecord converted;
+    converted.context_id = task.context_id;
+    converted.region_id = task.region_id;
+    converted.task_id = task.task_id;
+    converted.symbol = task.symbol;
+    converted.has_gpu_activity = task.has_gpu_activity;
+    converted.start_ns = task.start_ns;
+    converted.end_ns = task.end_ns;
+    converted.elapsed_ms = task.elapsed_ms;
+    converted.operation_count = task.operation_count;
+    converted.device_timings.reserve(task.device_timings.size());
+    for (const auto &device : task.device_timings) {
+      converted.device_timings.push_back(
+          {device.device_id, device.start_ns, device.end_ns,
+           device.elapsed_ms,
+           static_cast<std::uint64_t>(device.operation_count)});
+    }
+    result.tasks.push_back(std::move(converted));
+  }
+  return result;
+}
+
 SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
                         const std::vector<TaskIterationCounts>
                             &task_iteration_counts,
                         const std::vector<GpuKernelConfig> &gpu_kernel_configs,
-                        const TaskPlacement &task_placement)
+                        const RunConfig &run_config,
+                        cupti_task_profiler *profiler)
 {
+  const TaskPlacement &task_placement = run_config.task_placement;
   if (task_iteration_counts.size() != expanded_dags.size()) {
     throw std::logic_error(
         "task iteration count set does not match DAG count");
@@ -496,6 +573,15 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
   CudaEvent start_event("cudaEventCreate start");
   CudaEvent stop_event("cudaEventCreate stop");
   stream_ctx ctx;
+  ctx.set_task_serialization(
+      run_config.task_serialization == CudaFeatureState::enabled
+          ? task_serialization::enabled
+          : task_serialization::disabled);
+  std::uint64_t profile_context_id = 0;
+  ExpectedProfileTasks expected_profile_tasks;
+  if (profiler != nullptr) {
+    profile_context_id = profiler->attach(ctx);
+  }
 
   std::vector<DependencyDataStore> dependency_data_stores;
   dependency_data_stores.reserve(expanded_dags.size());
@@ -513,7 +599,9 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     submit_dag(ctx, expanded_dags[i], task_iteration_counts[i],
                gpu_kernel_configs[i],
-               dependency_data_stores[i], task_placement);
+               dependency_data_stores[i], task_placement,
+               profile_context_id,
+               profiler == nullptr ? nullptr : &expected_profile_tasks);
   }
   const auto submission_stop = Clock::now();
   cuda_check(cudaSetDevice(timing_device), "cudaSetDevice");
@@ -541,6 +629,11 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
       milliseconds(setup_start, setup_stop);
   result.diagnostics.sample_total_ms =
       milliseconds(sample_start, sample_stop);
+  if (profiler != nullptr) {
+    result.task_profile = associate_task_profile(
+        copy_task_activity_profile(profiler->collect(ctx)),
+        expected_profile_tasks, run_config.task_serialization);
+  }
   return result;
 }
 
@@ -578,18 +671,28 @@ int main(int argc, char **argv)
             expanded_dags, arguments.gpu_kernel_configs, devices);
     validate_device_memory(
         expanded_dags, arguments.run.task_placement);
+    const std::string workload_config_hash =
+        compute_workload_config_hash(
+            arguments.run, arguments.gpu_kernel_configs, expanded_dags);
     const std::string execution_config_hash =
         compute_execution_config_hash(
             arguments.run, arguments.gpu_kernel_configs, expanded_dags);
+    const std::string environment_hash =
+        compute_environment_hash(devices);
 
     if (task_bench_app.verbose) {
       task_bench_app.display();
     }
 
+    std::optional<cupti_task_profiler> profiler;
+    if (arguments.run.task_profiler == CudaFeatureState::enabled) {
+      profiler.emplace();
+    }
     for (int i = 0; i < arguments.run.warmup_samples; ++i) {
       (void)run_sample(expanded_dags, task_iteration_counts,
                        arguments.gpu_kernel_configs,
-                       arguments.run.task_placement);
+                       arguments.run,
+                       profiler.has_value() ? &*profiler : nullptr);
     }
     std::vector<SampleResult> samples;
     samples.reserve(arguments.run.measured_samples);
@@ -597,24 +700,39 @@ int main(int argc, char **argv)
       samples.push_back(
           run_sample(expanded_dags, task_iteration_counts,
                      arguments.gpu_kernel_configs,
-                     arguments.run.task_placement));
+                     arguments.run,
+                     profiler.has_value() ? &*profiler : nullptr));
     }
+    if (profiler.has_value()) {
+      (void)profiler->stop();
+    }
+
+    const DerivedMetrics derived_metrics =
+        derive_metrics(arguments.run, expanded_dags, samples);
+    const std::string raw_data_hash = compute_raw_data_hash(
+        workload_config_hash, execution_config_hash,
+        environment_hash, samples);
 
     print_report(arguments.run, devices, expanded_dags,
                  task_iteration_counts, arguments.gpu_kernel_configs,
                  kernel_resources, topology_metrics,
-                 execution_config_hash, samples);
+                 derived_metrics, workload_config_hash,
+                 execution_config_hash, environment_hash, samples);
     if (!arguments.output.run_json_path.empty()) {
       write_run_json(
           arguments.output.run_json_path, arguments.run, devices,
           arguments.core_arguments, expanded_dags,
           task_iteration_counts, arguments.gpu_kernel_configs,
-          kernel_resources, execution_config_hash, samples);
+          kernel_resources, workload_config_hash,
+          execution_config_hash, environment_hash,
+          raw_data_hash, samples);
     }
     if (!arguments.output.analysis_json_path.empty()) {
       write_analysis_json(
           arguments.output.analysis_json_path, expanded_dags,
-          topology_metrics, execution_config_hash);
+          topology_metrics, derived_metrics,
+          workload_config_hash, execution_config_hash,
+          environment_hash, raw_data_hash);
     }
     return 0;
   } catch (const std::exception &error) {

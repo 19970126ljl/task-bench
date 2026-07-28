@@ -5,6 +5,12 @@ NVCC ?= nvcc
 HOST_CC ?= gcc
 HOST_CXX ?= g++
 AR ?= ar
+NVCC_PATH = $(shell readlink -f $$(command -v $(firstword $(NVCC))) 2>/dev/null)
+NVCC_ROOT = $(shell dirname $$(dirname $(NVCC_PATH)) 2>/dev/null)
+NVCC_SDK_ROOT = $(shell dirname $(NVCC_ROOT) 2>/dev/null)
+NVCC_CUDA_VERSION = $(shell $(NVCC) --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+CUDA_ROOT ?= $(or $(CUDA_PATH),$(CUDA_HOME),$(if $(wildcard $(NVCC_ROOT)/extras/CUPTI),$(NVCC_ROOT),$(NVCC_SDK_ROOT)/cuda/$(NVCC_CUDA_VERSION)))
+CUPTI_ROOT ?= $(CUDA_ROOT)/extras/CUPTI
 CUDA_ARCH ?= native
 CUDA_NATIVE_CC = $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
 ifeq ($(CUDA_ARCH),native)
@@ -15,8 +21,9 @@ endif
 
 TARGET = task_bench
 UNIT_TEST = $(BUILD_DIR)/unit_test
-SOURCES = main.cu arguments.cc data_access.cc expanded_dag.cc identity.cc \
-	  results.cc task_placement.cc topology.cc workload.cc
+SOURCES = main.cu arguments.cc data_access.cc derived_metrics.cc \
+	  expanded_dag.cc identity.cc results.cc task_placement.cc \
+	  task_profile.cc topology.cc workload.cc
 OBJECTS = $(SOURCES:.cu=.o)
 OBJECTS := $(OBJECTS:.cc=.o)
 BACKEND_OBJECTS = $(OBJECTS) unit_test.o
@@ -40,11 +47,12 @@ TASKBENCH_WORKTREE_DIRTY ?= $(shell test -n "$$(git -C .. status --porcelain --u
 NVCCFLAGS = -std=c++17 -arch=$(CUDA_ARCH) \
 	    --expt-relaxed-constexpr --extended-lambda \
 	    -I../core -I$(CCCL_ROOT)/cudax/include \
-	    -I$(CCCL_ROOT)/libcudacxx/include
+	    -I$(CCCL_ROOT)/libcudacxx/include -I$(CUPTI_ROOT)/include
 BACKEND_CXXFLAGS = -std=c++17 -Wall -Wextra -I../core
 CORE_CFLAGS = -std=c11 -fPIC -I../core
 CORE_CXXFLAGS = -std=c++11 -fPIC -I../core
-LDFLAGS = $(CORE_LIB) -lcuda
+LDFLAGS = $(CORE_LIB) -L$(CUPTI_ROOT)/lib64 \
+	  -Xlinker=-rpath -Xlinker=$(CUPTI_ROOT)/lib64 -lcupti -lcuda
 
 ifeq ($(strip $(DEBUG)),1)
 NVCCFLAGS += -O0 -g -G
@@ -80,10 +88,11 @@ FORCE:
 
 test: $(TARGET) $(UNIT_TEST)
 	$(UNIT_TEST)
+	python3 test_analyze.py
 	./test.sh
 
 $(OBJECTS) unit_test.o $(CORE_OBJECTS): $(BUILD_CONFIG_STAMP)
-results.o: FORCE
+identity.o results.o: FORCE
 
 $(BUILD_CONFIG_STAMP): FORCE
 	@mkdir -p $(@D)
@@ -94,6 +103,7 @@ $(BUILD_CONFIG_STAMP): FORCE
 	  'NVCC=$(NVCC)' \
 	  'HOST_CC=$(HOST_CC)' \
 	  'HOST_CXX=$(HOST_CXX)' \
+	  'CUPTI_ROOT=$(CUPTI_ROOT)' \
 	  'CCCL_ROOT=$(CCCL_ROOT)' >$@.tmp
 	@if test -r $@ && cmp -s $@.tmp $@; then \
 	  rm -f $@.tmp; \
@@ -122,8 +132,9 @@ $(CORE_LIB): $(CORE_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
 
-$(UNIT_TEST): unit_test.o arguments.o data_access.o expanded_dag.o identity.o \
-	      results.o task_placement.o topology.o workload.o $(CORE_LIB)
+$(UNIT_TEST): unit_test.o arguments.o data_access.o derived_metrics.o \
+	      expanded_dag.o identity.o results.o task_placement.o topology.o \
+	      task_profile.o workload.o $(CORE_LIB)
 	@mkdir -p $(@D)
 	$(HOST_CXX) $(BACKEND_CXXFLAGS) $^ -o $@
 

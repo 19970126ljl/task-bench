@@ -98,6 +98,10 @@ run_case temporary_scratch_lifetime \
 "$task_bench" -h >"$test_tmp/help.out" 2>&1
 grep -F -- "-cuda-analysis-json [FILE]" \
   "$test_tmp/help.out" >/dev/null
+grep -F -- "-cuda-task-serialization [disabled|enabled]" \
+  "$test_tmp/help.out" >/dev/null
+grep -F -- "-cuda-task-profiler [disabled|enabled]" \
+  "$test_tmp/help.out" >/dev/null
 grep -F "every predecessor input is read completely once" \
   "$test_tmp/help.out" >/dev/null
 grep -F -- "-imbalance deterministically scales each" \
@@ -186,6 +190,124 @@ jq -e '
   .topology.dags[0].parallelism.peak == 6
 ' "$test_tmp/analysis-only.json" >/dev/null
 
+profile_common=(
+  -steps 2 -width 2 -type no_comm -field 1
+  -kernel compute_bound -iter 128
+  -cuda-blocks-per-task 2 -cuda-threads-per-block 64
+  -cuda-warmup 0 -cuda-runs 2
+)
+"$task_bench" "${profile_common[@]}" \
+  -cuda-task-profiler disabled \
+  -cuda-task-serialization disabled \
+  -cuda-json "$test_tmp/profile-base.json" \
+  >"$test_tmp/profile-base.out" 2>&1
+"$task_bench" "${profile_common[@]}" \
+  -cuda-task-profiler disabled \
+  -cuda-task-serialization enabled \
+  -cuda-json "$test_tmp/profile-serial.json" \
+  >"$test_tmp/profile-serial.out" 2>&1
+"$task_bench" "${profile_common[@]}" \
+  -cuda-task-profiler enabled \
+  -cuda-task-serialization disabled \
+  -cuda-json "$test_tmp/profile-normal.json" \
+  -cuda-analysis-json "$test_tmp/profile-normal-analysis.json" \
+  >"$test_tmp/profile-normal.out" 2>&1
+"$task_bench" "${profile_common[@]}" \
+  -cuda-task-profiler enabled \
+  -cuda-task-serialization enabled \
+  -cuda-json "$test_tmp/profile-serialized.json" \
+  -cuda-analysis-json "$test_tmp/profile-serialized-analysis.json" \
+  >"$test_tmp/profile-serialized.out" 2>&1
+"$task_bench" "${profile_common[@]}" \
+  -cuda-task-profiler enabled \
+  -cuda-task-serialization enabled \
+  -cuda-warmup 2 -cuda-runs 1 \
+  -cuda-json "$test_tmp/profile-warmup.json" \
+  -cuda-analysis-json "$test_tmp/profile-warmup-analysis.json" \
+  >"$test_tmp/profile-warmup.out" 2>&1
+python3 "$script_dir/analyze.py" \
+  --input "$test_tmp/profile-serialized.json" \
+  --output "$test_tmp/profile-serialized-offline.json"
+python3 - "$test_tmp" <<'PY'
+import json
+import math
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+def load(name):
+    return json.loads((root / name).read_text())
+
+def assert_equivalent(left, right, path="root"):
+    if isinstance(left, dict):
+        assert isinstance(right, dict) and left.keys() == right.keys(), path
+        for key in left:
+            assert_equivalent(left[key], right[key], f"{path}.{key}")
+    elif isinstance(left, list):
+        assert isinstance(right, list) and len(left) == len(right), path
+        for index, (left_item, right_item) in enumerate(zip(left, right)):
+            assert_equivalent(left_item, right_item, f"{path}[{index}]")
+    elif isinstance(left, float) or isinstance(right, float):
+        assert math.isclose(left, right, rel_tol=1e-13, abs_tol=1e-15), path
+    else:
+        assert left == right, path
+
+base = load("profile-base.json")
+serial = load("profile-serial.json")
+normal = load("profile-normal.json")
+profiled_serial = load("profile-serialized.json")
+normal_analysis = load("profile-normal-analysis.json")
+online = load("profile-serialized-analysis.json")
+offline = load("profile-serialized-offline.json")
+warmup = load("profile-warmup.json")
+warmup_analysis = load("profile-warmup-analysis.json")
+
+assert len({document["workload_config_hash"] for document in
+            (base, serial, normal, profiled_serial)}) == 1
+assert len({document["execution_config_hash"] for document in
+            (base, serial, normal, profiled_serial)}) == 4
+assert len({document["environment_hash"] for document in
+            (base, serial, normal, profiled_serial)}) == 1
+assert all(sample["task_profile"] is None
+           for document in (base, serial) for sample in document["samples"])
+assert normal_analysis["derived_metrics"]["parallelism"]["status"] == \
+       "unavailable"
+assert online["derived_metrics"]["parallelism"]["status"] == "available"
+assert_equivalent(online["derived_metrics"], offline["derived_metrics"])
+assert_equivalent(online["topology"], offline["topology"])
+assert online["source"]["raw_data_hash"] == offline["source"]["raw_data_hash"]
+assert online["source"]["environment_hash"] == \
+       offline["source"]["environment_hash"]
+for sample in profiled_serial["samples"]:
+    profile = sample["task_profile"]
+    assert len(profile["tasks"]) == 4
+    assert profile["contexts"][0]["task_serialization"] == "enabled"
+    intervals = sorted(
+        (task["start_ns"], task["end_ns"])
+        for task in profile["tasks"] if task["has_gpu_activity"])
+    assert all(left[1] <= right[0]
+               for left, right in zip(intervals, intervals[1:]))
+assert warmup["run_config"]["warmup_samples"] == 2
+assert warmup["run_config"]["measured_samples"] == 1
+assert len(warmup["samples"]) == 1
+assert len(warmup["samples"][0]["task_profile"]["tasks"]) == 4
+assert warmup_analysis["derived_metrics"]["parallelism"]["status"] == \
+       "available"
+PY
+
+grep -F "Median serialized collection makespan:" \
+  "$test_tmp/profile-serialized.out" >/dev/null
+grep -F "Measured task work:" "$test_tmp/profile-serialized.out" >/dev/null
+grep -F "Weighted critical path:" \
+  "$test_tmp/profile-serialized.out" >/dev/null
+grep -F "DAG parallelism: average" \
+  "$test_tmp/profile-serialized.out" >/dev/null
+if grep -F "Median DAG makespan:" \
+    "$test_tmp/profile-serialized.out" >/dev/null; then
+  echo "serialized collection reported a normal DAG makespan" >&2
+  exit 1
+fi
+
 if grep -E \
     "Max fan-in|Task data: total input reads|Task data accesses|Work: base" \
     "$test_tmp/json-a.out" >/dev/null; then
@@ -238,8 +360,12 @@ fi
 
 jq -e '
   .format == "cudastf-task-bench-run" and
+  .schema_version == 3 and
   .backend == "cudastf" and
+  (.workload_config_hash | test("^[0-9a-f]{16}$")) and
   (.execution_config_hash | test("^[0-9a-f]{16}$")) and
+  (.environment_hash | test("^[0-9a-f]{16}$")) and
+  (.raw_data_hash | test("^[0-9a-f]{16}$")) and
   .run_config.context == "stream" and
   .run_config.logical_data_allocator == "cached" and
   .run_config.device_ids == [0] and
@@ -247,6 +373,8 @@ jq -e '
   (.run_config | has("placement") | not) and
   .run_config.warmup_samples == 0 and
   .run_config.measured_samples == 2 and
+  .run_config.task_serialization == "disabled" and
+  .run_config.task_profiler == "disabled" and
   (.task_bench_revision | length) > 0 and
   (.task_bench_worktree_dirty | type) == "boolean" and
   (.cccl_revision | length) > 0 and
@@ -285,6 +413,13 @@ jq -e '
   (.dags[0].topology_hash | test("^[0-9a-f]{16}$")) and
   .dags[0].tasks == 40 and
   .dags[0].dependency_edges == 88 and
+  (.dags[0].task_table | length) == 40 and
+  .dags[0].task_table[0].dag_index == 0 and
+  .dags[0].task_table[0].timestep == 0 and
+  .dags[0].task_table[0].point == 0 and
+  .dags[0].task_table[0].configured_device == 0 and
+  (.dags[0].task_table[0].predecessors | length) == 0 and
+  (.dags[0].task_table[8].predecessors | length) == 2 and
   (.dags[0] | has("task_data_accesses") | not) and
   (.dags[0] | has("task_data_store_bytes") | not) and
   (has("aggregate_counts") | not) and
@@ -293,16 +428,21 @@ jq -e '
   (.samples[0].dag_makespan_ms | type) == "number" and
   (.samples[0].diagnostics.setup_ms | type) == "number" and
   (.samples[0].diagnostics.sample_total_ms | type) == "number" and
+  .samples[0].task_profile == null and
   (has("summary") | not) and
   (has("topology") | not)
 ' "$test_tmp/result-a.json" >/dev/null
 
 jq -e '
   .format == "cudastf-task-bench-analysis" and
+  .schema_version == 3 and
   .backend == "cudastf" and
   (.source.task_bench_revision | length) > 0 and
   (.source.task_bench_worktree_dirty | type) == "boolean" and
+  (.source.workload_config_hash | test("^[0-9a-f]{16}$")) and
   (.source.execution_config_hash | test("^[0-9a-f]{16}$")) and
+  (.source.environment_hash | test("^[0-9a-f]{16}$")) and
+  (.source.raw_data_hash | test("^[0-9a-f]{16}$")) and
   (.source.dags | length) == 1 and
   .source.dags[0].dag_index == 0 and
   (.source.dags[0].topology_hash | test("^[0-9a-f]{16}$")) and
@@ -316,7 +456,8 @@ jq -e '
   .topology.dags[0].parallelism.p50 == 8 and
   .topology.dags[0].parallelism.p95 == 8 and
   .topology.dags[0].parallelism.cv == 0 and
-  .topology.combined == (.topology.dags[0] | del(.dag_index))
+  .topology.combined == (.topology.dags[0] | del(.dag_index)) and
+  .derived_metrics.parallelism.status == "unavailable"
 ' "$test_tmp/analysis-a.json" >/dev/null
 
 topology_a=$(jq -r '.dags[0].topology_hash' "$test_tmp/result-a.json")
@@ -521,18 +662,54 @@ if [[ -n $max_device ]] && ((max_device >= 1)); then
     -kernel compute_bound -iter 128 \
     -cuda-blocks-per-task 2 -cuda-threads-per-block 64 \
     -cuda-devices 0,1 -cuda-placement cyclic \
+    -cuda-task-profiler enabled \
+    -cuda-task-serialization enabled \
     -cuda-warmup 0 -cuda-runs 1 \
     -cuda-json "$test_tmp/result-multi-gpu.json" \
+    -cuda-analysis-json "$test_tmp/analysis-multi-gpu.json" \
     >"$test_tmp/multi-gpu-json.out" 2>&1
   jq -e '
     .run_config.device_ids == [0,1] and
     .run_config.task_placement == "cyclic" and
+    .run_config.task_profiler == "enabled" and
+    .run_config.task_serialization == "enabled" and
     ([.devices[].device_id] == [0,1]) and
-    ([.dags[0].kernel.resources[].device_id] == [0,1])
+    ([.dags[0].kernel.resources[].device_id] == [0,1]) and
+    ([.samples[0].task_profile.tasks[].configured_device] | unique) ==
+      [0,1] and
+    all(.samples[0].task_profile.tasks[];
+        .configured_device as $device |
+        all(.device_timings[]; .device_id == $device))
   ' "$test_tmp/result-multi-gpu.json" >/dev/null
+  jq -e '.derived_metrics.parallelism.status == "available"' \
+    "$test_tmp/analysis-multi-gpu.json" >/dev/null
   grep -F \
     "Task placement: cyclic (round-robin by point)" \
     "$test_tmp/multi-gpu-json.out" >/dev/null
+
+  "$task_bench" \
+    -steps 1 -width 2 -type trivial \
+    -kernel compute_bound -iter 100000000 \
+    -cuda-blocks-per-task 1 -cuda-threads-per-block 64 \
+    -cuda-devices 0,1 -cuda-placement cyclic \
+    -cuda-task-profiler enabled \
+    -cuda-task-serialization disabled \
+    -cuda-warmup 0 -cuda-runs 1 \
+    -cuda-json "$test_tmp/profile-multi-gpu-normal.json" \
+    >"$test_tmp/profile-multi-gpu-normal.out" 2>&1
+  python3 - "$test_tmp/profile-multi-gpu-normal.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    run = json.load(source)
+tasks = run["samples"][0]["task_profile"]["tasks"]
+assert len(tasks) == 2
+left, right = tasks
+overlap_ns = min(left["end_ns"], right["end_ns"]) - \
+             max(left["start_ns"], right["start_ns"])
+assert overlap_ns > 0, f"expected normal task overlap, got {overlap_ns} ns"
+PY
 
   run_case multi_gpu_memory_and \
     -steps 3 -width 4 -type no_comm -field 1 \

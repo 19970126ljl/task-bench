@@ -17,7 +17,9 @@ make -C cudastf CUDA_ARCH=sm_80
 ```
 
 `CCCL_ROOT` defaults to `../../cccl`. `NVCC`, `HOST_CC`, and `HOST_CXX` may
-also be overridden.
+also be overridden. The CUPTI root is resolved from `CUDA_PATH`, `CUDA_HOME`,
+or the selected `nvcc`; set `CUPTI_ROOT` explicitly for nonstandard CUDA
+installations.
 
 ## Run
 
@@ -41,6 +43,8 @@ CUDASTF options:
 -cuda-context stream
 -cuda-warmup N
 -cuda-runs N
+-cuda-task-serialization disabled|enabled
+-cuda-task-profiler disabled|enabled
 -cuda-json FILE
 -cuda-analysis-json FILE
 -cuda-blocks-per-task N
@@ -57,6 +61,12 @@ and plural device options cannot be combined, and the default is GPU 0.
 `CUDASTF_DEFAULT_ALLOCATOR`
 selects `cached`, `cached_fifo`, `uncached`, or `pooled` and defaults to
 `cached`.
+
+Task serialization and profiling are independent and default to `disabled`.
+Serialization calls CUDASTF `set_task_serialization()` and changes scheduling;
+profiling collects task GPU activity without changing that setting. In
+particular, normal profiled runs provide task traces, while profiled and
+serialized runs provide isolated measured task durations.
 
 ## Workloads
 
@@ -88,8 +98,36 @@ submission and data ownership are defined in [`main.cu`](main.cu).
 ## Results
 
 Console output includes execution timing and derived topology metrics.
-`-cuda-json` records configuration, environment, identities, and raw samples;
-`-cuda-analysis-json` writes derived analysis separately.
+`-cuda-json` records configuration, the complete expanded DAG, placement,
+identities, raw samples, and all public CUDASTF profiler fields.
+`-cuda-analysis-json` writes topology and derived metrics separately. Warmups
+are profiled when requested but are never recorded or used for metric
+derivation.
+
+`measured_duration_ms` uses the same profiler interval as a normal task trace:
+the envelope from the first through the last correlated GPU operation in the
+task body. For each logical task, it is the median across measured serialized
+runs. These durations are mapped back to DAG nodes to derive weighted critical
+path and potential DAG parallelism under a model with unlimited task resources.
+CUDASTF-managed acquisition and automatic data movement before the task body
+are serialized but are outside this profiler interval.
+
+The serialized run's `dag_makespan_ms` is the cost of collecting isolated task
+measurements, not a performance baseline. Normal runs continue to report it as
+the end-to-end DAG makespan.
+
+Analysis can be regenerated without a GPU:
+
+```sh
+python3 cudastf/analyze.py --input run.json --output analysis.json
+```
+
+The analyzer recomputes and validates topology, workload, execution,
+environment, and raw-data hashes before deriving metrics. Analysis output uses
+`derived_metrics.parallelism`; normal profiled traces leave that entry
+unavailable and are retained for later `derived_metrics.concurrency` analysis.
+GPU UUIDs remain in raw provenance but do not affect same-model environment
+compatibility.
 
 `DAG makespan` is the CUDA event interval from the synchronized boundary before
 submission to the final CUDASTF fence. JSON field definitions are emitted by

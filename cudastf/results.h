@@ -1,13 +1,17 @@
 #ifndef TASK_BENCH_CUDASTF_RESULTS_H
 #define TASK_BENCH_CUDASTF_RESULTS_H
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "arguments.h"
 #include "expanded_dag.h"
+#include "task_profile.h"
 #include "topology.h"
 #include "workload.h"
+
+struct DerivedMetrics;
 
 struct CudaDeviceInfo {
   int device_id = 0;
@@ -36,6 +40,7 @@ struct SampleDiagnostics {
 struct SampleResult {
   PerformanceSample performance;
   SampleDiagnostics diagnostics;
+  std::optional<TaskProfileSample> task_profile;
 };
 
 struct PerformanceSummary {
@@ -54,7 +59,10 @@ void print_report(const RunConfig &run_config,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                   const KernelResourcesByDag &kernel_resources,
                   const TopologyMetrics &topology_metrics,
+                  const DerivedMetrics &derived_metrics,
+                  const std::string &workload_config_hash,
                   const std::string &execution_config_hash,
+                  const std::string &environment_hash,
                   const std::vector<SampleResult> &samples);
 void write_run_json(
     const std::string &path, const RunConfig &run_config,
@@ -64,12 +72,19 @@ void write_run_json(
     const std::vector<TaskIterationCounts> &task_iteration_counts,
     const std::vector<GpuKernelConfig> &gpu_kernel_configs,
     const KernelResourcesByDag &kernel_resources,
+    const std::string &workload_config_hash,
     const std::string &execution_config_hash,
+    const std::string &environment_hash,
+    const std::string &raw_data_hash,
     const std::vector<SampleResult> &samples);
 void write_analysis_json(
     const std::string &path,
     const std::vector<ExpandedDag> &expanded_dags,
     const TopologyMetrics &topology_metrics,
-    const std::string &execution_config_hash);
+    const DerivedMetrics &derived_metrics,
+    const std::string &workload_config_hash,
+    const std::string &execution_config_hash,
+    const std::string &environment_hash,
+    const std::string &raw_data_hash);
 
 #endif

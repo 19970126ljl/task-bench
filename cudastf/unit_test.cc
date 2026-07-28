@@ -12,7 +12,9 @@
 #include "data_access.h"
 #include "expanded_dag.h"
 #include "identity.h"
+#include "derived_metrics.h"
 #include "results.h"
+#include "task_profile.h"
 #include "topology.h"
 #include "workload.h"
 
@@ -313,6 +315,8 @@ void test_arguments()
   const Arguments arguments = parse_backend_arguments(
       {"-steps", "3", "-cuda-devices", "3,1",
        "-cuda-placement", "cyclic",
+       "-cuda-task-serialization", "enabled",
+       "-cuda-task-profiler", "enabled",
        "-cuda-json", "run.json",
        "-cuda-analysis-json", "analysis.json",
        "-cuda-blocks-per-task", "4",
@@ -330,7 +334,9 @@ void test_arguments()
   if (arguments.run.task_placement.devices !=
           std::vector<int>({3, 1}) ||
       arguments.run.task_placement.policy !=
-          TaskPlacementPolicy::cyclic) {
+          TaskPlacementPolicy::cyclic ||
+      arguments.run.task_serialization != CudaFeatureState::enabled ||
+      arguments.run.task_profiler != CudaFeatureState::enabled) {
     throw std::runtime_error("global task placement configuration mismatch");
   }
   if (arguments.output.run_json_path != "run.json" ||
@@ -368,6 +374,12 @@ void test_arguments()
       {"-cuda-shmem-bytes-per-block", "-1"}, "invalid value");
   expect_parse_failure(
       {"-cuda-compute-dtype", "fp16"}, "expected fp32 or fp64");
+  expect_parse_failure(
+      {"-cuda-task-serialization", "yes"},
+      "expected disabled or enabled");
+  expect_parse_failure(
+      {"-cuda-task-profiler", "on"},
+      "expected disabled or enabled");
   expect_parse_failure(
       {"-cuda-input-read-policy", "fixed"},
       "unknown CUDASTF option");
@@ -491,6 +503,13 @@ std::string execution_config_hash_for(const PreparedRun &run)
       run.expanded_dags);
 }
 
+std::string workload_config_hash_for(const PreparedRun &run)
+{
+  return compute_workload_config_hash(
+      run.arguments.run, run.arguments.gpu_kernel_configs,
+      run.expanded_dags);
+}
+
 void test_execution_identity()
 {
   const PreparedRun base = prepare_run(
@@ -500,9 +519,37 @@ void test_execution_identity()
        "-cuda-threads-per-block", "64",
        "-cuda-compute-dtype", "fp32"});
   const std::string base_hash = execution_config_hash_for(base);
-  if (base_hash != "b0da72ba5eec045c") {
+  if (base_hash != "ee697294a7612c6e") {
     throw std::runtime_error(
         "golden execution config hash changed: " + base_hash);
+  }
+  const std::string base_workload_hash = workload_config_hash_for(base);
+  if (base_workload_hash != "0427e328787717a8") {
+    throw std::runtime_error(
+        "golden workload config hash changed: " + base_workload_hash);
+  }
+
+  const PreparedRun serialized = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2", "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32",
+       "-cuda-task-serialization", "enabled"});
+  const PreparedRun profiled = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2", "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32",
+       "-cuda-task-profiler", "enabled"});
+  if (workload_config_hash_for(base) !=
+          workload_config_hash_for(serialized) ||
+      workload_config_hash_for(base) != workload_config_hash_for(profiled) ||
+      base_hash == execution_config_hash_for(serialized) ||
+      base_hash == execution_config_hash_for(profiled) ||
+      execution_config_hash_for(serialized) ==
+          execution_config_hash_for(profiled)) {
+    throw std::runtime_error(
+        "profiler/serialization hash axes are not orthogonal");
   }
 
   const PreparedRun explicit_single = prepare_run(
@@ -915,6 +962,310 @@ void test_statistics()
   expect_near("median DAG makespan", summary.median.dag_makespan_ms, 3.5225);
 }
 
+SampleResult make_profile_sample(
+    const ExpandedDag &dag, const std::vector<double> &durations_ms,
+    bool reverse_order)
+{
+  if (dag.tasks.size() != durations_ms.size()) {
+    throw std::logic_error("profile fixture duration count mismatch");
+  }
+  SampleResult sample;
+  sample.task_profile.emplace();
+  TaskProfileContext context;
+  context.context_id = 17;
+  context.task_serialization = CudaFeatureState::enabled;
+  context.task_count = dag.tasks.size();
+  sample.task_profile->contexts.push_back(context);
+  for (std::size_t offset = 0; offset < dag.tasks.size(); ++offset) {
+    const std::size_t i = reverse_order
+        ? dag.tasks.size() - 1 - offset
+        : offset;
+    const DagTask &dag_task = dag.tasks[i];
+    TaskProfileRecord task;
+    task.key = {dag_task.coordinates.dag_index,
+                dag_task.coordinates.timestep,
+                dag_task.coordinates.point};
+    task.configured_device = 0;
+    task.context_id = 17;
+    task.task_id = static_cast<int>(i + 1);
+    task.symbol = "fixture";
+    task.has_gpu_activity = true;
+    task.start_ns = UINT64_C(10000000) * (i + 1);
+    const std::uint64_t duration_ns = static_cast<std::uint64_t>(
+        durations_ms[i] * 1.0e6);
+    task.end_ns = task.start_ns + duration_ns;
+    task.elapsed_ms = durations_ms[i];
+    task.operation_count = 1;
+    task.device_timings.push_back(
+        {0, task.start_ns, task.end_ns, task.elapsed_ms, 1});
+    sample.task_profile->tasks.push_back(std::move(task));
+  }
+  return sample;
+}
+
+struct ProfileAssociationFixture {
+  TaskActivitySample activity;
+  ExpectedProfileTasks expected;
+};
+
+ProfileAssociationFixture make_profile_association_fixture()
+{
+  ProfileAssociationFixture fixture;
+  fixture.activity.cupti_timestamp_origin_ns = 42;
+  TaskProfileContext context;
+  context.context_id = 7;
+  context.has_gpu_activity = true;
+  context.start_ns = 100;
+  context.end_ns = 400;
+  context.elapsed_ms = 0.0003;
+  context.task_count = 2;
+  context.operation_count = 2;
+  context.task_serialization = CudaFeatureState::enabled;
+  fixture.activity.contexts.push_back(context);
+
+  TaskActivityRecord first;
+  first.context_id = 7;
+  first.task_id = 11;
+  first.symbol = "first";
+  first.has_gpu_activity = true;
+  first.start_ns = 100;
+  first.end_ns = 200;
+  first.elapsed_ms = 0.0001;
+  first.operation_count = 1;
+  first.device_timings.push_back({0, 100, 200, 0.0001, 1});
+
+  TaskActivityRecord second;
+  second.context_id = 7;
+  second.task_id = 12;
+  second.symbol = "second";
+  second.has_gpu_activity = true;
+  second.start_ns = 300;
+  second.end_ns = 400;
+  second.elapsed_ms = 0.0001;
+  second.operation_count = 1;
+  second.device_timings.push_back({1, 300, 400, 0.0001, 1});
+
+  // CUPTI task order is not a logical DAG ordering contract.
+  fixture.activity.tasks = {second, first};
+  fixture.expected.emplace(
+      RuntimeProfileKey{7, 11},
+      ExpectedProfileTask{{0, 0, 0}, 0, "first"});
+  fixture.expected.emplace(
+      RuntimeProfileKey{7, 12},
+      ExpectedProfileTask{{0, 0, 1}, 1, "second"});
+  return fixture;
+}
+
+void expect_profile_failure(
+    const char *name, const ProfileAssociationFixture &fixture,
+    const char *expected,
+    CudaFeatureState serialization = CudaFeatureState::enabled)
+{
+  try {
+    (void)associate_task_profile(
+        fixture.activity, fixture.expected, serialization);
+  } catch (const std::exception &error) {
+    if (std::string(error.what()).find(expected) != std::string::npos) {
+      return;
+    }
+    throw std::runtime_error(
+        std::string(name) + ": unexpected error: " + error.what());
+  }
+  throw std::runtime_error(
+      std::string(name) + ": expected profile validation failure");
+}
+
+void test_task_profile_association()
+{
+  const ProfileAssociationFixture valid =
+      make_profile_association_fixture();
+  const TaskProfileSample associated = associate_task_profile(
+      valid.activity, valid.expected, CudaFeatureState::enabled);
+  if (associated.tasks.size() != 2 ||
+      !(associated.tasks[0].key == DagTaskKey{0, 0, 1}) ||
+      !(associated.tasks[1].key == DagTaskKey{0, 0, 0})) {
+    throw std::runtime_error(
+        "runtime task IDs were not associated with logical tasks");
+  }
+
+  ProfileAssociationFixture changed = valid;
+  changed.activity.tasks[0].task_id = 99;
+  expect_profile_failure("unknown task", changed, "unknown context/task id");
+
+  changed = valid;
+  changed.activity.tasks.pop_back();
+  expect_profile_failure("missing task", changed, "task count");
+
+  changed = valid;
+  changed.activity.tasks[1].task_id = changed.activity.tasks[0].task_id;
+  changed.activity.tasks[1].symbol = changed.activity.tasks[0].symbol;
+  expect_profile_failure(
+      "duplicate task", changed, "duplicate context/task id");
+
+  changed = valid;
+  changed.activity.tasks[0].context_id = 8;
+  expect_profile_failure("task context", changed, "task context id");
+
+  changed = valid;
+  changed.activity.contexts[0].task_count = 3;
+  expect_profile_failure("context task count", changed, "task count");
+
+  changed = valid;
+  changed.activity.tasks[0].symbol = "wrong";
+  expect_profile_failure("task symbol", changed, "symbol mismatch");
+
+  changed = valid;
+  changed.activity.tasks[0].device_timings[0].device_id = 0;
+  expect_profile_failure("task device", changed, "configured placement");
+
+  changed = valid;
+  changed.activity.tasks[0].operation_count = 2;
+  expect_profile_failure("task operation count", changed, "invalid GPU activity");
+
+  changed = valid;
+  changed.activity.contexts[0].operation_count = 3;
+  expect_profile_failure(
+      "context operation count", changed, "operation count");
+
+  changed = valid;
+  changed.activity.tasks[0].has_gpu_activity = false;
+  changed.activity.tasks[0].start_ns = 0;
+  changed.activity.tasks[0].end_ns = 0;
+  changed.activity.tasks[0].elapsed_ms = 0.0;
+  changed.activity.tasks[0].operation_count = 0;
+  changed.activity.tasks[0].device_timings.clear();
+  changed.activity.contexts[0].operation_count = 1;
+  (void)associate_task_profile(
+      changed.activity, changed.expected, CudaFeatureState::enabled);
+  changed.activity.tasks[0].start_ns = 1;
+  expect_profile_failure(
+      "inactive task fields", changed, "nonzero timing data");
+
+  changed = valid;
+  changed.activity.tasks[0].start_ns = 150;
+  changed.activity.tasks[0].device_timings[0].start_ns = 150;
+  expect_profile_failure(
+      "serialized overlap", changed, "activity overlaps");
+
+  changed.activity.contexts[0].task_serialization =
+      CudaFeatureState::disabled;
+  (void)associate_task_profile(
+      changed.activity, changed.expected, CudaFeatureState::disabled);
+
+  expect_profile_failure(
+      "serialization metadata", valid, "serialization metadata mismatch",
+      CudaFeatureState::disabled);
+}
+
+void test_derived_parallelism_metrics()
+{
+  const ExpandedDag dag = make_layered_dag({2, 1});
+  RunConfig config;
+  config.task_profiler = CudaFeatureState::enabled;
+  config.task_serialization = CudaFeatureState::enabled;
+  const std::vector<SampleResult> samples{
+      make_profile_sample(dag, {1.0, 3.0, 2.0}, false),
+      make_profile_sample(dag, {3.0, 5.0, 4.0}, true)};
+
+  const ParallelismAnalysis &analysis =
+      derive_metrics(config, {dag}, samples).parallelism;
+  if (!analysis.available || analysis.dags.size() != 1) {
+    throw std::runtime_error("parallelism analysis is unavailable");
+  }
+  const DagParallelismMetrics &metrics = analysis.dags.front();
+  if (metrics.tasks.size() != 3 ||
+      metrics.tasks[0].measured_duration_ms != 2.0 ||
+      metrics.tasks[1].measured_duration_ms != 4.0 ||
+      metrics.tasks[2].measured_duration_ms != 3.0) {
+    throw std::runtime_error("measured task median mismatch");
+  }
+  expect_near("measured work", metrics.parallelism.work_ms, 9.0);
+  expect_near(
+      "weighted critical path", metrics.parallelism.critical_path_ms, 5.0);
+  expect_near("DAG parallelism average", metrics.parallelism.average, 1.8);
+  if (metrics.parallelism.peak != 2) {
+    throw std::runtime_error("DAG parallelism peak mismatch");
+  }
+  expect_near("DAG parallelism p50", metrics.parallelism.p50, 2.0);
+  expect_near("DAG parallelism p95", metrics.parallelism.p95, 2.0);
+  expect_near("DAG parallelism CV", metrics.parallelism.cv, 2.0 / 9.0);
+  expect_near("duration mean", metrics.task_duration.mean_ms, 3.0);
+  expect_near("duration median", metrics.task_duration.median_ms, 3.0);
+  expect_near("duration p95", metrics.task_duration.p95_ms, 4.0);
+  expect_near(
+      "duration CV", metrics.task_duration.cv,
+      std::sqrt(2.0 / 3.0) / 3.0);
+
+  ExpandedDag chain = make_layered_dag({1, 1});
+  ExpandedDag independent = make_layered_dag({2});
+  independent.task_graph.graph_index = 1;
+  for (DagTask &task : independent.tasks) {
+    task.coordinates.dag_index = 1;
+  }
+  SampleResult combined_sample;
+  combined_sample.task_profile.emplace();
+  TaskProfileContext combined_context;
+  combined_context.context_id = 19;
+  combined_context.task_serialization = CudaFeatureState::enabled;
+  combined_context.task_count = 4;
+  combined_sample.task_profile->contexts.push_back(combined_context);
+  const auto append_tasks =
+      [&](const ExpandedDag &fixture_dag,
+          const std::vector<double> &durations) {
+        for (std::size_t i = 0; i < fixture_dag.tasks.size(); ++i) {
+          const DagTask &dag_task = fixture_dag.tasks[i];
+          TaskProfileRecord task;
+          task.key = {dag_task.coordinates.dag_index,
+                      dag_task.coordinates.timestep,
+                      dag_task.coordinates.point};
+          task.configured_device = 0;
+          task.context_id = 19;
+          task.task_id = static_cast<int>(
+              combined_sample.task_profile->tasks.size() + 1);
+          task.symbol = "combined-fixture";
+          task.has_gpu_activity = true;
+          task.start_ns = UINT64_C(10000000) * task.task_id;
+          task.end_ns = task.start_ns + static_cast<std::uint64_t>(
+              durations[i] * 1.0e6);
+          task.elapsed_ms = durations[i];
+          task.operation_count = 1;
+          task.device_timings.push_back(
+              {0, task.start_ns, task.end_ns, task.elapsed_ms, 1});
+          combined_sample.task_profile->tasks.push_back(std::move(task));
+        }
+      };
+  append_tasks(chain, {2.0, 3.0});
+  append_tasks(independent, {4.0, 1.0});
+  const ParallelismMetrics &combined =
+      derive_metrics(config, {chain, independent}, {combined_sample})
+          .parallelism.combined_parallelism;
+  expect_near("combined measured work", combined.work_ms, 10.0);
+  expect_near("combined weighted critical path",
+              combined.critical_path_ms, 5.0);
+  expect_near("combined DAG parallelism average", combined.average, 2.0);
+  if (combined.peak != 3) {
+    throw std::runtime_error("combined DAG parallelism peak mismatch");
+  }
+  expect_near("combined DAG parallelism p50", combined.p50, 2.0);
+  expect_near("combined DAG parallelism p95", combined.p95, 3.0);
+
+  RunConfig normal = config;
+  normal.task_serialization = CudaFeatureState::disabled;
+  if (derive_metrics(normal, {dag}, samples).parallelism.available) {
+    throw std::runtime_error(
+        "normal profiled execution produced DAG parallelism metrics");
+  }
+
+  const std::string first_hash =
+      compute_raw_data_hash("w", "e", "environment", samples);
+  std::vector<SampleResult> changed = samples;
+  changed[0].task_profile->tasks[0].end_ns++;
+  if (first_hash ==
+      compute_raw_data_hash("w", "e", "environment", changed)) {
+    throw std::runtime_error("raw data hash ignored task timing");
+  }
+}
+
 }  // namespace
 
 int main()
@@ -929,6 +1280,8 @@ int main()
     test_task_iteration_counts();
     test_topology_metrics();
     test_statistics();
+    test_task_profile_association();
+    test_derived_parallelism_metrics();
     std::cout << "CUDASTF host unit tests passed\n";
     return 0;
   } catch (const std::exception &error) {

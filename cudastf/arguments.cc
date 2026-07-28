@@ -69,6 +69,20 @@ ComputeDataType parse_compute_data_type(const char *flag, const char *text)
                            ": " + text + "; expected fp32 or fp64");
 }
 
+CudaFeatureState parse_cuda_feature_state(const char *flag,
+                                          const char *text)
+{
+  if (!std::strcmp(text, "disabled")) {
+    return CudaFeatureState::disabled;
+  }
+  if (!std::strcmp(text, "enabled")) {
+    return CudaFeatureState::enabled;
+  }
+  throw std::runtime_error(std::string("invalid value for ") + flag +
+                           ": " + text +
+                           "; expected disabled or enabled");
+}
+
 std::vector<int> parse_device_list(const char *flag, const char *text)
 {
   const std::string value(text);
@@ -182,6 +196,12 @@ Arguments parse_arguments(int argc, char **argv)
       if (arguments.run.measured_samples == 0) {
         throw std::runtime_error("-cuda-runs must be greater than zero");
       }
+    } else if (!std::strcmp(arg, "-cuda-task-serialization")) {
+      arguments.run.task_serialization = parse_cuda_feature_state(
+          arg, require_value(i, argc, argv));
+    } else if (!std::strcmp(arg, "-cuda-task-profiler")) {
+      arguments.run.task_profiler = parse_cuda_feature_state(
+          arg, require_value(i, argc, argv));
     } else if (!std::strcmp(arg, "-cuda-context")) {
       arguments.run.context = require_value(i, argc, argv);
     } else if (!std::strcmp(arg, "-cuda-json")) {
@@ -247,6 +267,15 @@ const char *compute_data_type_name(ComputeDataType type)
   throw std::logic_error("unknown compute data type");
 }
 
+const char *cuda_feature_state_name(CudaFeatureState state)
+{
+  switch (state) {
+  case CudaFeatureState::disabled: return "disabled";
+  case CudaFeatureState::enabled: return "enabled";
+  }
+  throw std::logic_error("unknown CUDA feature state");
+}
+
 void print_backend_help()
 {
   std::printf("\nCUDASTF backend options:\n");
@@ -261,6 +290,10 @@ void print_backend_help()
               "-cuda-warmup [INT]");
   std::printf("  %-24s number of measured samples (default: 5)\n",
               "-cuda-runs [INT]");
+  std::printf("  %-40s serialize task execution (default: disabled)\n",
+              "-cuda-task-serialization [disabled|enabled]");
+  std::printf("  %-40s collect CUPTI task profiles (default: disabled)\n",
+              "-cuda-task-profiler [disabled|enabled]");
   std::printf("  %-24s write raw run record\n",
               "-cuda-json [FILE]");
   std::printf("  %-24s write derived analysis\n",

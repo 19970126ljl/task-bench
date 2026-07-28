@@ -8,6 +8,32 @@
 #include <string>
 #include <type_traits>
 
+#include "results.h"
+
+#ifndef TASKBENCH_CCCL_REVISION
+#define TASKBENCH_CCCL_REVISION "unknown"
+#endif
+
+#ifndef TASKBENCH_REVISION
+#define TASKBENCH_REVISION "unknown"
+#endif
+
+#ifndef TASKBENCH_CCCL_WORKTREE_DIRTY
+#define TASKBENCH_CCCL_WORKTREE_DIRTY 0
+#endif
+
+#ifndef TASKBENCH_WORKTREE_DIRTY
+#define TASKBENCH_WORKTREE_DIRTY 0
+#endif
+
+#ifndef TASKBENCH_BUILD_TYPE
+#define TASKBENCH_BUILD_TYPE "unknown"
+#endif
+
+#ifndef TASKBENCH_CUDA_ARCH_RESOLVED
+#define TASKBENCH_CUDA_ARCH_RESOLVED "unknown"
+#endif
+
 namespace {
 
 class StableHash {
@@ -125,7 +151,7 @@ std::string compute_topology_hash(const std::vector<DagTask> &tasks)
   return hash.hex_digest();
 }
 
-std::string compute_execution_config_hash(
+std::string compute_workload_config_hash(
     const RunConfig &run_config,
     const std::vector<GpuKernelConfig> &gpu_kernel_configs,
     const std::vector<ExpandedDag> &expanded_dags)
@@ -136,7 +162,7 @@ std::string compute_execution_config_hash(
   }
 
   StableHash hash;
-  hash.add_string("cudastf-execution-config");
+  hash.add_string("cudastf-workload-config");
   hash.add_string(run_config.context);
   hash.add_string(run_config.logical_data_allocator);
   if (run_config.task_placement.devices.empty()) {
@@ -170,5 +196,118 @@ std::string compute_execution_config_hash(
         gpu_kernel_config.launch.dynamic_shared_memory_bytes);
   }
 
+  return hash.hex_digest();
+}
+
+std::string compute_execution_config_hash(
+    const RunConfig &run_config,
+    const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+    const std::vector<ExpandedDag> &expanded_dags)
+{
+  StableHash hash;
+  hash.add_string("cudastf-execution-config");
+  hash.add_string(compute_workload_config_hash(
+      run_config, gpu_kernel_configs, expanded_dags));
+  hash.add_string(cuda_feature_state_name(
+      run_config.task_serialization));
+  hash.add_string(cuda_feature_state_name(run_config.task_profiler));
+  return hash.hex_digest();
+}
+
+std::string compute_environment_hash(
+    const std::vector<CudaDeviceInfo> &devices)
+{
+  if (devices.empty()) {
+    throw std::logic_error("execution environment has no CUDA devices");
+  }
+  StableHash hash;
+  hash.add_string("cudastf-environment");
+  hash.add_string(TASKBENCH_REVISION);
+  hash.add_u8(TASKBENCH_WORKTREE_DIRTY ? 1 : 0);
+  hash.add_string(TASKBENCH_CCCL_REVISION);
+  hash.add_u8(TASKBENCH_CCCL_WORKTREE_DIRTY ? 1 : 0);
+  hash.add_string(TASKBENCH_BUILD_TYPE);
+  hash.add_string(TASKBENCH_CUDA_ARCH_RESOLVED);
+  hash.add_i64(devices.front().runtime_version);
+  hash.add_i64(devices.front().driver_version);
+  hash.add_u64(devices.size());
+  for (const CudaDeviceInfo &device : devices) {
+    hash.add_string(device.name);
+    hash.add_i64(device.compute_capability_major);
+    hash.add_i64(device.compute_capability_minor);
+  }
+  return hash.hex_digest();
+}
+
+std::string compute_raw_data_hash(
+    const std::string &workload_config_hash,
+    const std::string &execution_config_hash,
+    const std::string &environment_hash,
+    const std::vector<SampleResult> &samples)
+{
+  StableHash hash;
+  hash.add_string("cudastf-raw-data");
+  hash.add_string(workload_config_hash);
+  hash.add_string(execution_config_hash);
+  hash.add_string(environment_hash);
+  hash.add_u64(samples.size());
+  for (const SampleResult &sample : samples) {
+    hash.add_f64(sample.performance.submission_ms);
+    hash.add_f64(sample.performance.dag_makespan_ms);
+    hash.add_f64(sample.diagnostics.setup_ms);
+    hash.add_f64(sample.diagnostics.sample_total_ms);
+    hash.add_u8(sample.task_profile.has_value() ? 1 : 0);
+    if (!sample.task_profile.has_value()) continue;
+
+    const TaskProfileSample &profile = *sample.task_profile;
+    hash.add_u64(profile.cupti_timestamp_origin_ns);
+    hash.add_u64(profile.contexts.size());
+    for (const TaskProfileContext &context : profile.contexts) {
+      hash.add_u64(context.context_id);
+      hash.add_string(context.label);
+      hash.add_u8(context.has_gpu_activity ? 1 : 0);
+      hash.add_u64(context.start_ns);
+      hash.add_u64(context.end_ns);
+      hash.add_f64(context.elapsed_ms);
+      hash.add_u64(context.task_count);
+      hash.add_u64(context.operation_count);
+      hash.add_string(cuda_feature_state_name(context.task_serialization));
+      hash.add_u64(context.regions.size());
+      for (const TaskProfileRegion &region : context.regions) {
+        hash.add_u64(region.region_id);
+        hash.add_string(region.label);
+        hash.add_u8(region.has_gpu_activity ? 1 : 0);
+        hash.add_u64(region.start_ns);
+        hash.add_u64(region.end_ns);
+        hash.add_f64(region.elapsed_ms);
+        hash.add_u64(region.task_count);
+        hash.add_u64(region.operation_count);
+      }
+    }
+    hash.add_u64(profile.tasks.size());
+    for (const TaskProfileRecord &task : profile.tasks) {
+      hash.add_i64(task.key.dag_index);
+      hash.add_i64(task.key.timestep);
+      hash.add_i64(task.key.point);
+      hash.add_i64(task.configured_device);
+      hash.add_u64(task.context_id);
+      hash.add_u64(task.region_id);
+      hash.add_i64(task.task_id);
+      hash.add_string(task.symbol);
+      hash.add_u8(task.has_gpu_activity ? 1 : 0);
+      hash.add_u64(task.start_ns);
+      hash.add_u64(task.end_ns);
+      hash.add_f64(task.elapsed_ms);
+      hash.add_u64(task.operation_count);
+      hash.add_u64(task.device_timings.size());
+      for (const TaskDeviceProfile &device : task.device_timings) {
+        hash.add_i64(device.device_id);
+        hash.add_u64(device.start_ns);
+        hash.add_u64(device.end_ns);
+        hash.add_f64(device.elapsed_ms);
+        hash.add_u64(device.operation_count);
+      }
+    }
+  }
   return hash.hex_digest();
 }

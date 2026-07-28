@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "workload.h"
+#include "derived_metrics.h"
 
 #ifndef TASKBENCH_CCCL_REVISION
 #define TASKBENCH_CCCL_REVISION "unknown"
@@ -170,7 +171,136 @@ void write_sample(std::ostream &out, const SampleResult &sample)
       << ",\"diagnostics\":{\"setup_ms\":"
       << sample.diagnostics.setup_ms
       << ",\"sample_total_ms\":" << sample.diagnostics.sample_total_ms
-      << "}}";
+      << "},\"task_profile\":";
+  if (!sample.task_profile.has_value()) {
+    out << "null}";
+    return;
+  }
+
+  const TaskProfileSample &profile = *sample.task_profile;
+  out << "{\"cupti_timestamp_origin_ns\":"
+      << profile.cupti_timestamp_origin_ns << ",\"contexts\":[";
+  for (std::size_t i = 0; i < profile.contexts.size(); ++i) {
+    if (i != 0) out << ",";
+    const TaskProfileContext &context = profile.contexts[i];
+    out << "{\"context_id\":" << context.context_id
+        << ",\"label\":\"" << json_escape(context.label)
+        << "\",\"has_gpu_activity\":"
+        << (context.has_gpu_activity ? "true" : "false")
+        << ",\"start_ns\":" << context.start_ns
+        << ",\"end_ns\":" << context.end_ns
+        << ",\"elapsed_ms\":" << context.elapsed_ms
+        << ",\"task_count\":" << context.task_count
+        << ",\"operation_count\":" << context.operation_count
+        << ",\"task_serialization\":\""
+        << cuda_feature_state_name(context.task_serialization)
+        << "\",\"regions\":[";
+    for (std::size_t j = 0; j < context.regions.size(); ++j) {
+      if (j != 0) out << ",";
+      const TaskProfileRegion &region = context.regions[j];
+      out << "{\"region_id\":" << region.region_id
+          << ",\"label\":\"" << json_escape(region.label)
+          << "\",\"has_gpu_activity\":"
+          << (region.has_gpu_activity ? "true" : "false")
+          << ",\"start_ns\":" << region.start_ns
+          << ",\"end_ns\":" << region.end_ns
+          << ",\"elapsed_ms\":" << region.elapsed_ms
+          << ",\"task_count\":" << region.task_count
+          << ",\"operation_count\":" << region.operation_count << "}";
+    }
+    out << "]}";
+  }
+  out << "],\"tasks\":[";
+  for (std::size_t i = 0; i < profile.tasks.size(); ++i) {
+    if (i != 0) out << ",";
+    const TaskProfileRecord &task = profile.tasks[i];
+    out << "{\"dag_index\":" << task.key.dag_index
+        << ",\"timestep\":" << task.key.timestep
+        << ",\"point\":" << task.key.point
+        << ",\"configured_device\":" << task.configured_device
+        << ",\"context_id\":" << task.context_id
+        << ",\"region_id\":" << task.region_id
+        << ",\"task_id\":" << task.task_id
+        << ",\"symbol\":\"" << json_escape(task.symbol)
+        << "\",\"has_gpu_activity\":"
+        << (task.has_gpu_activity ? "true" : "false")
+        << ",\"start_ns\":" << task.start_ns
+        << ",\"end_ns\":" << task.end_ns
+        << ",\"elapsed_ms\":" << task.elapsed_ms
+        << ",\"operation_count\":" << task.operation_count
+        << ",\"device_timings\":[";
+    for (std::size_t j = 0; j < task.device_timings.size(); ++j) {
+      if (j != 0) out << ",";
+      const TaskDeviceProfile &device = task.device_timings[j];
+      out << "{\"device_id\":" << device.device_id
+          << ",\"start_ns\":" << device.start_ns
+          << ",\"end_ns\":" << device.end_ns
+          << ",\"elapsed_ms\":" << device.elapsed_ms
+          << ",\"operation_count\":" << device.operation_count << "}";
+    }
+    out << "]}";
+  }
+  out << "]}}";
+}
+
+void write_duration_statistics(
+    std::ostream &out, const DurationStatistics &statistics)
+{
+  out << "{\"mean_ms\":" << statistics.mean_ms
+      << ",\"median_ms\":" << statistics.median_ms
+      << ",\"p95_ms\":" << statistics.p95_ms
+      << ",\"cv\":" << statistics.cv << "}";
+}
+
+void write_parallelism_metrics(
+    std::ostream &out, const ParallelismMetrics &metrics)
+{
+  out << "{\"work_ms\":" << metrics.work_ms
+      << ",\"critical_path_ms\":" << metrics.critical_path_ms
+      << ",\"average\":" << metrics.average
+      << ",\"peak\":" << metrics.peak
+      << ",\"p50\":" << metrics.p50
+      << ",\"p95\":" << metrics.p95
+      << ",\"cv\":" << metrics.cv << "}";
+}
+
+void write_parallelism_analysis(
+    std::ostream &out, const ParallelismAnalysis &analysis)
+{
+  if (!analysis.available) {
+    out << "{\"status\":\"unavailable\",\"reason\":\""
+        << json_escape(analysis.unavailable_reason) << "\"}";
+    return;
+  }
+
+  out << "{\"status\":\"available\",\"duration_aggregation\":\"median\""
+      << ",\"duration_definition\":\"gpu_activity_envelope\""
+      << ",\"dags\":[";
+  for (std::size_t i = 0; i < analysis.dags.size(); ++i) {
+    if (i != 0) out << ",";
+    const DagParallelismMetrics &dag = analysis.dags[i];
+    out << "{\"dag_index\":" << dag.dag_index << ",\"tasks\":[";
+    for (std::size_t j = 0; j < dag.tasks.size(); ++j) {
+      if (j != 0) out << ",";
+      const MeasuredTaskDuration &task = dag.tasks[j];
+      out << "{\"dag_index\":" << task.key.dag_index
+          << ",\"timestep\":" << task.key.timestep
+          << ",\"point\":" << task.key.point
+          << ",\"configured_device\":" << task.configured_device
+          << ",\"measured_duration_ms\":"
+          << task.measured_duration_ms << "}";
+    }
+    out << "],\"task_duration\":";
+    write_duration_statistics(out, dag.task_duration);
+    out << ",\"parallelism\":";
+    write_parallelism_metrics(out, dag.parallelism);
+    out << "}";
+  }
+  out << "],\"combined\":{\"task_duration\":";
+  write_duration_statistics(out, analysis.combined_task_duration);
+  out << ",\"parallelism\":";
+  write_parallelism_metrics(out, analysis.combined_parallelism);
+  out << "}}";
 }
 
 void print_topology_metrics(const char *indent,
@@ -392,7 +522,10 @@ void print_report(const RunConfig &run_config,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                   const KernelResourcesByDag &kernel_resources,
                   const TopologyMetrics &topology_metrics,
+                  const DerivedMetrics &derived_metrics,
+                  const std::string &workload_config_hash,
                   const std::string &execution_config_hash,
+                  const std::string &environment_hash,
                   const std::vector<SampleResult> &samples)
 {
   validate_dag_results(
@@ -422,6 +555,12 @@ void print_report(const RunConfig &run_config,
         << ")";
   }
   std::cout << "\n"
+            << "  Task serialization: "
+            << cuda_feature_state_name(run_config.task_serialization)
+            << "\n"
+            << "  Task profiler: "
+            << cuda_feature_state_name(run_config.task_profiler)
+            << "\n"
             << "  DAGs: " << expanded_dags.size() << "\n";
   if (expanded_dags.size() > 1) {
     std::cout << "  Combined DAGs:\n";
@@ -498,15 +637,36 @@ void print_report(const RunConfig &run_config,
                 << kernel_workload.total_scratch_write_bytes << " bytes\n";
     }
   }
-  std::cout << "  Execution config hash: "
+  std::cout << "  Workload config hash: "
+            << workload_config_hash << "\n"
+            << "  Execution config hash: "
             << execution_config_hash << "\n"
+            << "  Environment hash: " << environment_hash << "\n"
             << std::fixed << std::setprecision(3)
             << "  Median submission: "
-            << summary.median.submission_ms << " ms\n"
-            << "  Median DAG makespan: "
-            << summary.median.dag_makespan_ms << " ms\n"
-            << "  DAG makespan p95: " << summary.p95.dag_makespan_ms
-            << " ms\n";
+            << summary.median.submission_ms << " ms\n";
+  if (run_config.task_serialization == CudaFeatureState::enabled) {
+    std::cout << "  Median serialized collection makespan: "
+              << summary.median.dag_makespan_ms << " ms\n"
+              << "  Serialized collection makespan p95: "
+              << summary.p95.dag_makespan_ms << " ms\n";
+  } else {
+    std::cout << "  Median DAG makespan: "
+              << summary.median.dag_makespan_ms << " ms\n"
+              << "  DAG makespan p95: " << summary.p95.dag_makespan_ms
+              << " ms\n";
+  }
+  if (derived_metrics.parallelism.available) {
+    const ParallelismMetrics &combined =
+        derived_metrics.parallelism.combined_parallelism;
+    std::cout << "  Measured task work: " << combined.work_ms << " ms\n"
+              << "  Weighted critical path: "
+              << combined.critical_path_ms << " ms\n"
+              << "  DAG parallelism: average "
+              << combined.average << ", peak " << combined.peak
+              << ", p50 " << combined.p50 << ", p95 "
+              << combined.p95 << ", CV " << combined.cv << "\n";
+  }
 }
 
 void write_run_json(
@@ -517,7 +677,10 @@ void write_run_json(
     const std::vector<TaskIterationCounts> &task_iteration_counts,
     const std::vector<GpuKernelConfig> &gpu_kernel_configs,
     const KernelResourcesByDag &kernel_resources,
+    const std::string &workload_config_hash,
     const std::string &execution_config_hash,
+    const std::string &environment_hash,
+    const std::string &raw_data_hash,
     const std::vector<SampleResult> &samples)
 {
   validate_dag_results(
@@ -530,6 +693,7 @@ void write_run_json(
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
       << "  \"format\":\"cudastf-task-bench-run\",\n"
+      << "  \"schema_version\":3,\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION) << "\",\n"
@@ -583,9 +747,17 @@ void write_run_json(
       << json_escape(run_config.logical_data_allocator)
       << "\",\"warmup_samples\":" << run_config.warmup_samples
       << ",\"measured_samples\":" << run_config.measured_samples
-      << "},\n"
+      << ",\"task_serialization\":\""
+      << cuda_feature_state_name(run_config.task_serialization)
+      << "\",\"task_profiler\":\""
+      << cuda_feature_state_name(run_config.task_profiler)
+      << "\"},\n"
+      << "  \"workload_config_hash\":\""
+      << workload_config_hash << "\",\n"
       << "  \"execution_config_hash\":\""
-      << execution_config_hash << "\",\n";
+      << execution_config_hash << "\",\n"
+      << "  \"environment_hash\":\"" << environment_hash << "\",\n"
+      << "  \"raw_data_hash\":\"" << raw_data_hash << "\",\n";
 
   out << "  \"dags\":[\n";
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
@@ -640,7 +812,32 @@ void write_run_json(
         << ",\"topology_hash\":\"" << expanded_dag.topology_hash
         << "\",\"tasks\":" << expanded_dag.tasks.size()
         << ",\"dependency_edges\":"
-        << expanded_dag.dependency_edges << "}";
+        << expanded_dag.dependency_edges << ",\"task_table\":[";
+    for (std::size_t task_index = 0;
+         task_index < expanded_dag.tasks.size(); ++task_index) {
+      if (task_index != 0) out << ",";
+      const DagTask &task = expanded_dag.tasks[task_index];
+      out << "{\"dag_index\":" << task.coordinates.dag_index
+          << ",\"timestep\":" << task.coordinates.timestep
+          << ",\"point\":" << task.coordinates.point
+          << ",\"configured_device\":"
+          << run_config.task_placement.device_for(
+                 expanded_dag.task_graph, task.coordinates)
+          << ",\"iterations\":"
+          << task_iteration_counts[i][task_index]
+          << ",\"predecessors\":[";
+      for (std::size_t predecessor_index = 0;
+           predecessor_index < task.predecessors.size();
+           ++predecessor_index) {
+        if (predecessor_index != 0) out << ",";
+        const Predecessor &predecessor =
+            task.predecessors[predecessor_index];
+        out << "{\"timestep\":" << predecessor.timestep
+            << ",\"point\":" << predecessor.point << "}";
+      }
+      out << "]}";
+    }
+    out << "]}";
     out << (i + 1 == expanded_dags.size() ? "\n" : ",\n");
   }
   out << "  ],\n"
@@ -661,7 +858,11 @@ void write_analysis_json(
     const std::string &path,
     const std::vector<ExpandedDag> &expanded_dags,
     const TopologyMetrics &topology_metrics,
-    const std::string &execution_config_hash)
+    const DerivedMetrics &derived_metrics,
+    const std::string &workload_config_hash,
+    const std::string &execution_config_hash,
+    const std::string &environment_hash,
+    const std::string &raw_data_hash)
 {
   validate_topology_metrics(expanded_dags, topology_metrics);
   std::ofstream out(path);
@@ -673,13 +874,18 @@ void write_analysis_json(
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
       << "  \"format\":\"cudastf-task-bench-analysis\",\n"
+      << "  \"schema_version\":3,\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"source\":{\"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION)
       << "\",\"task_bench_worktree_dirty\":"
       << (TASKBENCH_WORKTREE_DIRTY ? "true" : "false")
+      << ",\"workload_config_hash\":\""
+      << workload_config_hash << "\""
       << ",\"execution_config_hash\":\""
-      << execution_config_hash << "\",\"dags\":[";
+      << execution_config_hash << "\",\"raw_data_hash\":\""
+      << raw_data_hash << "\",\"environment_hash\":\""
+      << environment_hash << "\",\"dags\":[";
   for (std::size_t i = 0; i < expanded_dags.size(); ++i) {
     if (i != 0) out << ",";
     out << "{\"dag_index\":" << expanded_dags[i].dag_index()
@@ -696,7 +902,9 @@ void write_analysis_json(
   }
   out << "],\"combined\":{";
   write_topology_metric_fields(out, topology_metrics.combined);
-  out << "}}\n}\n";
+  out << "}},\n  \"derived_metrics\":{\"parallelism\":";
+  write_parallelism_analysis(out, derived_metrics.parallelism);
+  out << "}\n}\n";
 
   if (!out) {
     throw std::runtime_error(

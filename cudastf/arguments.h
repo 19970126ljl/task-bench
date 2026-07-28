@@ -18,6 +18,11 @@ enum class ComputeDataType {
   fp64,
 };
 
+enum class CudaFeatureState {
+  disabled,
+  enabled,
+};
+
 struct GpuKernelConfig {
   GpuKernelLaunchConfig launch;
   ComputeDataType compute_data_type = ComputeDataType::fp32;
@@ -29,6 +34,8 @@ struct RunConfig {
   int measured_samples = 5;
   std::string context = "stream";
   std::string logical_data_allocator = "cached";
+  CudaFeatureState task_serialization = CudaFeatureState::disabled;
+  CudaFeatureState task_profiler = CudaFeatureState::disabled;
 };
 
 struct OutputConfig {
@@ -48,6 +55,7 @@ struct Arguments {
 
 Arguments parse_arguments(int argc, char **argv);
 const char *compute_data_type_name(ComputeDataType type);
+const char *cuda_feature_state_name(CudaFeatureState state);
 void print_backend_help();
 
 #endif
