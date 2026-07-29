@@ -165,6 +165,10 @@ std::string compute_workload_config_hash(
   hash.add_string("cudastf-workload-config");
   hash.add_string(run_config.context);
   hash.add_string(run_config.logical_data_allocator);
+  if (run_config.stream_pool_size_per_device == 0) {
+    throw std::logic_error("stream pool size was not resolved");
+  }
+  hash.add_u64(run_config.stream_pool_size_per_device);
   if (run_config.task_placement.devices.empty()) {
     throw std::logic_error("execution configuration has no CUDA devices");
   }

@@ -226,6 +226,11 @@ class CompareTest(unittest.TestCase):
         refresh_hashes(changed_workload)
         cases.append(("workload", changed_workload, "workload configuration"))
 
+        changed_pool = make_normal_run()
+        changed_pool["run_config"]["stream_pool_size_per_device"] += 1
+        refresh_hashes(changed_pool)
+        cases.append(("stream pool", changed_pool, "workload configuration"))
+
         changed_environment = make_normal_run()
         changed_environment["devices"][0]["name"] = "different-gpu"
         refresh_hashes(changed_environment)

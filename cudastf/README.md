@@ -43,6 +43,7 @@ CUDASTF options:
 -cuda-context stream
 -cuda-warmup N
 -cuda-runs N
+-cuda-stream-pool-size N
 -cuda-task-serialization disabled|enabled
 -cuda-task-profiler disabled|enabled
 -cuda-json FILE
@@ -61,6 +62,13 @@ and plural device options cannot be combined, and the default is GPU 0.
 `CUDASTF_DEFAULT_ALLOCATOR`
 selects `cached`, `cached_fifo`, `uncached`, or `pooled` and defaults to
 `cached`.
+
+`-cuda-stream-pool-size N` sets both CUDASTF compute and data stream pool
+sizes to `N` on every selected GPU. It is global and defaults to the largest
+configured DAG width. CUDASTF creates the streams lazily. The pool size limits
+the streams available to tasks, but it does not guarantee that `N` kernels can
+execute concurrently because DAG dependencies and GPU kernel resources still
+apply.
 
 Task serialization and profiling are independent and default to `disabled`.
 Serialization calls CUDASTF `set_task_serialization()` and changes scheduling;
@@ -151,8 +159,9 @@ python3 cudastf/analyze.py --input run.json --output analysis.json
 
 The analyzer recomputes and validates topology, workload, execution,
 environment, and raw-data hashes before deriving metrics. Raw run JSON uses
-schema 4 and analysis JSON uses schema 5. GPU UUIDs remain in raw provenance
-but do not affect same-model environment compatibility.
+schema 5 and analysis JSON uses schema 5; the analyzer also accepts historical
+run schema 4. GPU UUIDs remain in raw provenance but do not affect same-model
+environment compatibility.
 
 Compare a profiled serialized run with a separate profiled normal run:
 

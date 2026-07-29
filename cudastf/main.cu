@@ -30,9 +30,11 @@
 #include "workload.cuh"
 
 using cuda::experimental::stf::exec_place;
+using cuda::experimental::stf::async_resources_handle;
 using cuda::experimental::stf::logical_data;
 using cuda::experimental::stf::slice;
 using cuda::experimental::stf::stream_ctx;
+using cuda::experimental::stf::stream_pool_config;
 using cuda::experimental::stf::cupti_task_profiler;
 using cuda::experimental::stf::task_activity_profile;
 using cuda::experimental::stf::task_serialization;
@@ -573,7 +575,13 @@ SampleResult run_sample(const std::vector<ExpandedDag> &expanded_dags,
   const auto setup_start = Clock::now();
   CudaEvent start_event("cudaEventCreate start");
   CudaEvent stop_event("cudaEventCreate stop");
-  stream_ctx ctx;
+  if (run_config.stream_pool_size_per_device == 0) {
+    throw std::logic_error("stream pool size was not resolved");
+  }
+  stream_pool_config pool_config;
+  pool_config.compute_size = run_config.stream_pool_size_per_device;
+  pool_config.data_size = run_config.stream_pool_size_per_device;
+  stream_ctx ctx{async_resources_handle{pool_config}};
   ctx.set_task_serialization(
       run_config.task_serialization == CudaFeatureState::enabled
           ? task_serialization::enabled
@@ -655,6 +663,14 @@ int main(int argc, char **argv)
       throw std::logic_error(
           "GPU kernel configuration count does not match Task Bench graphs");
     }
+    std::vector<long> dag_widths;
+    dag_widths.reserve(task_bench_app.graphs.size());
+    for (const TaskGraph &task_graph : task_bench_app.graphs) {
+      dag_widths.push_back(task_graph.max_width);
+    }
+    arguments.run.stream_pool_size_per_device =
+        resolve_stream_pool_size_per_device(
+            arguments.run.stream_pool_size_per_device, dag_widths);
     const std::vector<ExpandedDag> expanded_dags =
         expand_task_graphs(task_bench_app);
     const TopologyMetrics topology_metrics =

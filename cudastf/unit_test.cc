@@ -65,6 +65,14 @@ PreparedRun prepare_run(std::vector<std::string> arguments)
   if (parsed.gpu_kernel_configs.size() != expanded_dags.size()) {
     throw std::runtime_error("test GPU configuration count mismatch");
   }
+  std::vector<long> dag_widths;
+  dag_widths.reserve(task_bench_app.graphs.size());
+  for (const TaskGraph &task_graph : task_bench_app.graphs) {
+    dag_widths.push_back(task_graph.max_width);
+  }
+  parsed.run.stream_pool_size_per_device =
+      resolve_stream_pool_size_per_device(
+          parsed.run.stream_pool_size_per_device, dag_widths);
   return {std::move(parsed), std::move(expanded_dags)};
 }
 
@@ -318,6 +326,7 @@ void test_arguments()
        "-cuda-placement", "cyclic",
        "-cuda-task-serialization", "enabled",
        "-cuda-task-profiler", "enabled",
+       "-cuda-stream-pool-size", "17",
        "-cuda-json", "run.json",
        "-cuda-analysis-json", "analysis.json",
        "-cuda-blocks-per-task", "4",
@@ -336,6 +345,7 @@ void test_arguments()
           std::vector<int>({3, 1}) ||
       arguments.run.task_placement.policy !=
           TaskPlacementPolicy::cyclic ||
+      arguments.run.stream_pool_size_per_device != 17 ||
       arguments.run.task_serialization != CudaFeatureState::enabled ||
       arguments.run.task_profiler != CudaFeatureState::enabled) {
     throw std::runtime_error("global task placement configuration mismatch");
@@ -382,6 +392,10 @@ void test_arguments()
       {"-cuda-task-profiler", "on"},
       "expected disabled or enabled");
   expect_parse_failure(
+      {"-cuda-stream-pool-size", "0"}, "must be greater than zero");
+  expect_parse_failure(
+      {"-cuda-stream-pool-size", "-1"}, "invalid value");
+  expect_parse_failure(
       {"-cuda-input-read-policy", "fixed"},
       "unknown CUDASTF option");
   expect_parse_failure(
@@ -408,6 +422,12 @@ void test_arguments()
       {"-cuda-json", "same.json",
        "-cuda-analysis-json", "same.json"},
       "require different paths");
+
+  if (resolve_stream_pool_size_per_device(0, {4}) != 4 ||
+      resolve_stream_pool_size_per_device(0, {4, 9, 6}) != 9 ||
+      resolve_stream_pool_size_per_device(7, {4, 9, 6}) != 7) {
+    throw std::runtime_error("stream pool size resolution mismatch");
+  }
 }
 
 void test_task_placement()
@@ -520,14 +540,48 @@ void test_execution_identity()
        "-cuda-threads-per-block", "64",
        "-cuda-compute-dtype", "fp32"});
   const std::string base_hash = execution_config_hash_for(base);
-  if (base_hash != "ee697294a7612c6e") {
+  if (base_hash != "9b8afaac89a4b2f5") {
     throw std::runtime_error(
         "golden execution config hash changed: " + base_hash);
   }
   const std::string base_workload_hash = workload_config_hash_for(base);
-  if (base_workload_hash != "0427e328787717a8") {
+  if (base_workload_hash != "dace00b65edd135b") {
     throw std::runtime_error(
         "golden workload config hash changed: " + base_workload_hash);
+  }
+
+  const PreparedRun explicit_default_pool = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32",
+       "-cuda-stream-pool-size", "5"});
+  const PreparedRun changed_pool = prepare_run(
+      {"-steps", "4", "-width", "5", "-type", "stencil_1d",
+       "-field", "2", "-kernel", "compute_bound", "-iter", "10",
+       "-cuda-blocks-per-task", "2",
+       "-cuda-threads-per-block", "64",
+       "-cuda-compute-dtype", "fp32",
+       "-cuda-stream-pool-size", "6"});
+  if (execution_config_hash_for(base) !=
+          execution_config_hash_for(explicit_default_pool) ||
+      workload_config_hash_for(base) !=
+          workload_config_hash_for(explicit_default_pool) ||
+      execution_config_hash_for(base) ==
+          execution_config_hash_for(changed_pool) ||
+      workload_config_hash_for(base) ==
+          workload_config_hash_for(changed_pool)) {
+    throw std::runtime_error(
+        "stream pool size execution identity mismatch");
+  }
+
+  const PreparedRun multiple_widths = prepare_run(
+      {"-steps", "2", "-width", "4", "-type", "trivial", "-and",
+       "-steps", "2", "-width", "9", "-type", "no_comm"});
+  if (multiple_widths.arguments.run.stream_pool_size_per_device != 9) {
+    throw std::runtime_error(
+        "multi-DAG stream pool size did not use maximum width");
   }
 
   const PreparedRun serialized = prepare_run(

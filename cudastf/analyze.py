@@ -153,6 +153,11 @@ def compute_workload_config_hash(run):
     hasher.add_string("cudastf-workload-config")
     hasher.add_string(config["context"])
     hasher.add_string(config["logical_data_allocator"])
+    if run.get("schema_version") == 5:
+        stream_pool_size = config["stream_pool_size_per_device"]
+        if not isinstance(stream_pool_size, int) or stream_pool_size <= 0:
+            raise ValueError("invalid stream pool size per device")
+        hasher.add_u64(stream_pool_size)
     hasher.add_i64(device_ids[0])
     if len(device_ids) > 1:
         hasher.add_string("multi-gpu-placement")
@@ -953,7 +958,7 @@ def analyze_concurrency(run):
 def analyze(run):
     if run.get("format") != "cudastf-task-bench-run":
         raise ValueError("input is not a CUDASTF Task Bench run JSON")
-    if run.get("schema_version") != 4:
+    if run.get("schema_version") not in {4, 5}:
         raise ValueError("unsupported run JSON schema version")
     for dag in run["dags"]:
         actual_topology_hash = compute_topology_hash(dag)

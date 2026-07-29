@@ -102,6 +102,8 @@ grep -F -- "-cuda-task-serialization [disabled|enabled]" \
   "$test_tmp/help.out" >/dev/null
 grep -F -- "-cuda-task-profiler [disabled|enabled]" \
   "$test_tmp/help.out" >/dev/null
+grep -F -- "-cuda-stream-pool-size [INT]" \
+  "$test_tmp/help.out" >/dev/null
 grep -F "every predecessor input is read completely once" \
   "$test_tmp/help.out" >/dev/null
 grep -F -- "-imbalance deterministically scales each" \
@@ -133,8 +135,13 @@ grep -F "Reverse Dependencies:" "$test_tmp/full_verbose.out" >/dev/null
   -cuda-analysis-json "$test_tmp/analysis-a.json" \
   >"$test_tmp/json-a.out" 2>&1
 "$task_bench" -steps 5 -width 8 -type stencil_1d -field 2 \
+  -cuda-stream-pool-size 8 \
   -cuda-warmup 0 -cuda-runs 1 -cuda-json "$test_tmp/result-b.json" \
   >"$test_tmp/json-b.out" 2>&1
+"$task_bench" -steps 5 -width 8 -type stencil_1d -field 2 \
+  -cuda-stream-pool-size 3 \
+  -cuda-warmup 0 -cuda-runs 1 -cuda-json "$test_tmp/result-pool.json" \
+  >"$test_tmp/json-pool.out" 2>&1
 "$task_bench" -steps 5 -width 8 -type stencil_1d -field 2 \
   -cuda-devices 0 -cuda-placement cyclic \
   -cuda-warmup 0 -cuda-runs 1 \
@@ -443,7 +450,7 @@ fi
 
 jq -e '
   .format == "cudastf-task-bench-run" and
-  .schema_version == 4 and
+  .schema_version == 5 and
   .backend == "cudastf" and
   (.workload_config_hash | test("^[0-9a-f]{16}$")) and
   (.execution_config_hash | test("^[0-9a-f]{16}$")) and
@@ -451,6 +458,7 @@ jq -e '
   (.raw_data_hash | test("^[0-9a-f]{16}$")) and
   .run_config.context == "stream" and
   .run_config.logical_data_allocator == "cached" and
+  .run_config.stream_pool_size_per_device == 8 and
   .run_config.device_ids == [0] and
   .run_config.task_placement == "block" and
   (.run_config | has("placement") | not) and
@@ -582,8 +590,12 @@ execution_uncached=$(
 execution_single_list=$(
   jq -r '.execution_config_hash' "$test_tmp/result-single-list.json"
 )
+execution_pool=$(
+  jq -r '.execution_config_hash' "$test_tmp/result-pool.json"
+)
 test "$execution_a" = "$execution_b"
 test "$execution_a" = "$execution_single_list"
+test "$execution_a" != "$execution_pool"
 test "$execution_a" != "$execution_workload"
 test "$execution_workload" != "$execution_imbalance"
 test "$execution_a" != "$execution_uncached"
@@ -593,8 +605,12 @@ jq -e --arg execution "$execution_a" --arg topology "$topology_a" '
 ' "$test_tmp/analysis-a.json" >/dev/null
 jq -e '.run_config.logical_data_allocator == "uncached"' \
   "$test_tmp/result-uncached.json" >/dev/null
+test "$(jq -r '.run_config.stream_pool_size_per_device' \
+  "$test_tmp/result-pool.json")" = 3
 grep -F "Logical data allocator: uncached" \
   "$test_tmp/json-uncached.out" >/dev/null
+grep -F "Stream pool size per device: 8 (compute/data)" \
+  "$test_tmp/json-a.out" >/dev/null
 grep -F \
   "Kernel workload iterations: 4096/task, total 163840" \
   "$test_tmp/json-workload.out" >/dev/null
@@ -716,6 +732,8 @@ expect_failure invalid_placement "expected block or cyclic" \
   -cuda-placement random
 expect_failure zero_blocks "must be greater than zero" \
   -cuda-blocks-per-task 0
+expect_failure zero_stream_pool "must be greater than zero" \
+  -cuda-stream-pool-size 0
 expect_failure negative_threads "invalid value" \
   -cuda-threads-per-block -1
 expect_failure invalid_compute_dtype "expected fp32 or fp64" \

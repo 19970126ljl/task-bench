@@ -30,6 +30,8 @@ struct GpuKernelConfig {
 
 struct RunConfig {
   TaskPlacement task_placement;
+  // Resolved from the maximum DAG width after core argument parsing.
+  std::size_t stream_pool_size_per_device = 0;
   int warmup_samples = 1;
   int measured_samples = 5;
   std::string context = "stream";
@@ -54,6 +56,8 @@ struct Arguments {
 };
 
 Arguments parse_arguments(int argc, char **argv);
+std::size_t resolve_stream_pool_size_per_device(
+    std::size_t configured_size, const std::vector<long> &dag_widths);
 const char *compute_data_type_name(ComputeDataType type);
 const char *cuda_feature_state_name(CudaFeatureState state);
 void print_backend_help();

@@ -1,5 +1,6 @@
 #include "arguments.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -50,6 +51,16 @@ std::size_t parse_size(const char *flag, const char *text)
                              ": " + text);
   }
   return static_cast<std::size_t>(value);
+}
+
+std::size_t parse_positive_size(const char *flag, const char *text)
+{
+  const std::size_t value = parse_size(flag, text);
+  if (value == 0) {
+    throw std::runtime_error(std::string(flag) +
+                             " must be greater than zero");
+  }
+  return value;
 }
 
 const char *require_value(int &i, int argc, char **argv)
@@ -154,6 +165,27 @@ std::vector<char *> Arguments::core_argv()
   return result;
 }
 
+std::size_t resolve_stream_pool_size_per_device(
+    std::size_t configured_size, const std::vector<long> &dag_widths)
+{
+  if (dag_widths.empty()) {
+    throw std::logic_error(
+        "cannot resolve stream pool size without a DAG");
+  }
+  if (configured_size != 0) return configured_size;
+
+  std::size_t result = 0;
+  for (long width : dag_widths) {
+    if (width <= 0 ||
+        static_cast<std::uintmax_t>(width) >
+            std::numeric_limits<std::size_t>::max()) {
+      throw std::logic_error("DAG width cannot be used as stream pool size");
+    }
+    result = std::max(result, static_cast<std::size_t>(width));
+  }
+  return result;
+}
+
 Arguments parse_arguments(int argc, char **argv)
 {
   Arguments arguments;
@@ -196,6 +228,9 @@ Arguments parse_arguments(int argc, char **argv)
       if (arguments.run.measured_samples == 0) {
         throw std::runtime_error("-cuda-runs must be greater than zero");
       }
+    } else if (!std::strcmp(arg, "-cuda-stream-pool-size")) {
+      arguments.run.stream_pool_size_per_device =
+          parse_positive_size(arg, require_value(i, argc, argv));
     } else if (!std::strcmp(arg, "-cuda-task-serialization")) {
       arguments.run.task_serialization = parse_cuda_feature_state(
           arg, require_value(i, argc, argv));
@@ -290,6 +325,8 @@ void print_backend_help()
               "-cuda-warmup [INT]");
   std::printf("  %-24s number of measured samples (default: 5)\n",
               "-cuda-runs [INT]");
+  std::printf("  %-36s compute/data streams per device (default: max width)\n",
+              "-cuda-stream-pool-size [INT]");
   std::printf("  %-40s serialize task execution (default: disabled)\n",
               "-cuda-task-serialization [disabled|enabled]");
   std::printf("  %-40s collect CUPTI task profiles (default: disabled)\n",

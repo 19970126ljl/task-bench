@@ -134,7 +134,7 @@ def make_run():
     dag["topology_hash"] = analyze.compute_topology_hash(dag)
     run = {
         "format": "cudastf-task-bench-run",
-        "schema_version": 4,
+        "schema_version": 5,
         "backend": "cudastf",
         "task_bench_revision": "fixture",
         "task_bench_worktree_dirty": False,
@@ -168,6 +168,7 @@ def make_run():
             "task_placement": "block",
             "context": "stream",
             "logical_data_allocator": "cached",
+            "stream_pool_size_per_device": 2,
             "warmup_samples": 0,
             "measured_samples": 2,
             "task_profiler": "enabled",
@@ -281,6 +282,16 @@ class AnalyzeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw data hash mismatch"):
             analyze.analyze(changed)
 
+    def test_schema_4_run_remains_supported(self):
+        run = make_run()
+        run["schema_version"] = 4
+        del run["run_config"]["stream_pool_size_per_device"]
+        run["workload_config_hash"] = analyze.compute_workload_config_hash(run)
+        run["execution_config_hash"] = analyze.compute_execution_config_hash(run)
+        run["raw_data_hash"] = analyze.compute_raw_data_hash(run)
+        result = analyze.analyze(run)
+        self.assertEqual(result["schema_version"], 5)
+
     def test_normal_profile_has_no_parallelism_analysis(self):
         run = make_normal_run()
         result = analyze.analyze(run)
@@ -362,6 +373,8 @@ class AnalyzeTest(unittest.TestCase):
                 "iterations", 256), "workload config"),
             ("placement", lambda run: run["run_config"].__setitem__(
                 "task_placement", "cyclic"), "workload config"),
+            ("stream pool", lambda run: run["run_config"].__setitem__(
+                "stream_pool_size_per_device", 3), "workload config"),
             ("build", lambda run: run["build"].__setitem__(
                 "type", "debug"), "environment"),
             ("gpu model", lambda run: run["devices"][0].__setitem__(

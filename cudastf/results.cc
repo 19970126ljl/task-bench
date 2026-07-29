@@ -778,6 +778,9 @@ void print_report(const RunConfig &run_config,
             << "  Context: " << run_config.context << "\n"
             << "  Logical data allocator: "
             << run_config.logical_data_allocator << "\n"
+            << "  Stream pool size per device: "
+            << run_config.stream_pool_size_per_device
+            << " (compute/data)\n"
             << "  Devices: ";
   for (std::size_t i = 0; i < devices.size(); ++i) {
     if (i != 0) std::cout << ", ";
@@ -974,7 +977,7 @@ void write_run_json(
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
       << "  \"format\":\"cudastf-task-bench-run\",\n"
-      << "  \"schema_version\":4,\n"
+      << "  \"schema_version\":5,\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION) << "\",\n"
@@ -1027,7 +1030,9 @@ void write_run_json(
       << "\",\"context\":\"" << json_escape(run_config.context)
       << "\",\"logical_data_allocator\":\""
       << json_escape(run_config.logical_data_allocator)
-      << "\",\"warmup_samples\":" << run_config.warmup_samples
+      << "\",\"stream_pool_size_per_device\":"
+      << run_config.stream_pool_size_per_device
+      << ",\"warmup_samples\":" << run_config.warmup_samples
       << ",\"measured_samples\":" << run_config.measured_samples
       << ",\"task_serialization\":\""
       << cuda_feature_state_name(run_config.task_serialization)
