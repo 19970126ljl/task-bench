@@ -1,259 +1,169 @@
-# Task-Level Parallelism Metrics
+# Task-Level Parallelism And Concurrency Metrics
 
 ## Research Objective
 
-Determine whether task-level DAG parallelism can explain or predict CUDASTF
-execution performance, why potential parallelism and realized concurrency
-differ, and when increasing task parallelism improves or harms performance.
+Determine how CUDASTF DAG structure, measured task duration, and the runtime
+schedule affect execution performance. The implemented metric layers are:
 
-The metric model has four semantic layers:
+- topology: DAG structure with unit-cost tasks;
+- potential parallelism: an ideal ASAP model weighted by serialized task
+  measurements;
+- actual concurrency: task overlap observed in a normal CUDASTF execution.
 
-- topology: graph structure with unit-cost tasks;
-- measured task duration: isolated task costs collected with global task
-  serialization;
-- runtime schedule: task behavior under normal CUDASTF execution;
-- device operations: GPU and interconnect activity used for later root-cause
-  analysis.
+Task profiling and task serialization are independent controls. Potential
+parallelism requires both controls enabled. Actual concurrency requires task
+profiling enabled and task serialization disabled.
 
-Task serialization and task profiling are independent controls. Serialization
-changes scheduling. Profiling records task GPU activity. Potential DAG
-parallelism requires both controls to be enabled; actual runtime concurrency
-requires profiling with serialization disabled.
-
-## Common Definitions
+## Task Identity And Time
 
 Each logical task has the stable key `(dag_index, timestep, point)`. A profiled
-CUDASTF task is associated with that key through `(context_id, task_id)` and
-validated against its symbol and configured device. Measurements must never
-assume submission, profiler output, or completion order is stable.
+CUDASTF task is associated with that key through `(context_id, task_id)` and is
+validated against its symbol and configured device. Submission, profiler
+output, and completion order are not identity contracts.
 
-For task `i`:
-
-```text
-pred(i)          DAG predecessor tasks
-device(i)        configured placement device
-submit_i         time the runtime receives the task
-dag_ready_i      max completion time of pred(i), or execution start for a source
-dag_eligible_i   max(submit_i, dag_ready_i)
-start_i          beginning of the task's correlated GPU work
-finish_i         completion of the task's correlated GPU work
-duration_i       finish_i - start_i
-```
-
-The profiler interval is the envelope from the first through the last
-correlated GPU operation in the task body. It excludes waiting for
-predecessors and CUDASTF-managed acquisition before the task body. A task may
-contain multiple GPU operations; its interval ends after its last operation.
-
-Timestamp formulas are valid only within a common clock domain. Task and
-device activity timestamps in one CUPTI profile share an origin. Host and
-device timestamps, or unrelated GPU clock domains, must not be subtracted
-without explicit correlation.
-
-Duration distributions use mean, median, p95, and population coefficient of
-variation:
+For task `i`, the profiler interval is:
 
 ```text
-CV = population_standard_deviation / mean
+start_i       earliest correlated GPU operation start
+finish_i      latest correlated GPU operation end
+duration_i    finish_i - start_i
 ```
 
-Time-varying parallelism and concurrency use time-weighted statistics. A value
-lasting 10 ms has ten times the weight of a value lasting 1 ms. Topology level
-statistics instead give every unit-cost ASAP level equal weight.
+The interval is the task GPU activity envelope. It excludes predecessor
+waiting and CUDASTF-managed acquisition before the task body. One task may
+contain multiple correlated GPU operations.
 
-Warmups are excluded from stored samples and all derived metrics. Measured
-repetitions are independent. Multiple independent DAGs are reported both per
-DAG and as a disjoint union; all DAGs begin at time zero in a combined model.
+Task timestamps within one CUPTI profile share the profile's CUPTI origin.
+CUDA event durations, CUPTI timestamps, and host timestamps must not be
+treated as having a common origin without explicit correlation.
+
+Duration distributions use mean, median, nearest-rank p95, and population
+coefficient of variation. Time-varying metrics use duration-weighted p50,
+p95, and population coefficient of variation. Intervals are half-open:
+`[start, finish)`.
+
+Warmups are never stored or included in derived metrics. Every measured sample
+is analyzed independently.
 
 ## Topology
 
-Topology metrics use only tasks and dependency edges. Every task has unit cost;
-workload, data size, placement, and measured time have no effect.
+Topology metrics use only task and dependency-edge structure. Each task has
+unit cost:
 
 ```text
 start_i^0  = max(finish_j^0 for j in pred(i)), or 0 for a source
 finish_i^0 = start_i^0 + 1
 
 N             number of tasks
-E             number of DAG dependency edges
+E             number of dependency edges
 L_0           unit-cost critical-path length
-P_0           N / L_0, average topology parallelism
+P_0           N / L_0
 A_0(k)        tasks in unit-cost ASAP level k
-A_0_peak      max A_0(k)
-A_0_p50/p95   level-width quantiles
-A_0_cv        variation of level widths
 ```
 
-Every integer level in `[0, L_0)` contributes one observation, so `P_0` is the
-arithmetic mean of `A_0(k)`. `E` describes the graph but is not itself a
-parallelism metric. `A_0_peak` is the peak of this deterministic unit-cost ASAP
-schedule, not maximum antichain width.
+Selected outputs are task count, edge count, critical-path length, and the
+average, peak, p50, p95, and CV of ASAP level width. Level percentiles weight
+each integer ASAP level equally. Combined topology treats independent DAGs as
+a disjoint union beginning at modeled time zero.
 
-## Measured Task Duration
+## Potential DAG Parallelism
 
-With global task serialization enabled, no two task GPU activity intervals may
-overlap across any selected device. The original DAG, task body, inputs,
-outputs, placement, and runtime-managed data movement remain unchanged; this
-is not a separate microbenchmark.
-
-For every logical task, collect one duration per measured serialized sample:
+With global task serialization enabled, task GPU envelopes must not overlap on
+any selected device. For every logical task:
 
 ```text
-d_i^measured = median serialized GPU activity duration for task i
+d_i^serialized = median task duration across measured serialized samples
 ```
 
-The median is the selected aggregation. These are real measurements, not
-estimates. The minimum is not used because it decreases systematically as the
-number of repetitions increases. Variation between repetitions remains
-measurement diagnostics; variation across `d_i^measured` values describes
-logical task-time imbalance.
+These are real profiler measurements made without inter-task GPU overlap. The
+serialized sample's `dag_makespan_ms` is collection cost, not sequential DAG
+latency or a performance baseline.
 
-The serialized run's `dag_makespan_ms` is collection cost. It is neither
-sequential DAG latency nor a performance baseline and is not used in the
-parallelism model.
-
-For multi-GPU placement, each task is measured on its configured device.
-Serialization prevents overlap globally, not merely per device.
-
-## Weighted DAG Parallelism
-
-Assign `d_i^measured` to the corresponding DAG node and construct an
-idealized ASAP schedule with unlimited task resources:
+Map each `d_i^serialized` back to its DAG node and construct an ideal ASAP
+schedule with unlimited task resources:
 
 ```text
-start_i^weighted  = max(finish_j^weighted for j in pred(i)), or 0 for a source
-finish_i^weighted = start_i^weighted + d_i^measured
+start_i^weighted  = max(finish_j^weighted for j in pred(i)), or 0
+finish_i^weighted = start_i^weighted + d_i^serialized
 
-W_measured        = sum d_i^measured
-L_weighted        = max finish_i^weighted
+task_work         = sum d_i^serialized
+critical_path     = max finish_i^weighted
 P(t)              = count(i where start_i^weighted <= t < finish_i^weighted)
-P_average         = W_measured / L_weighted
+average           = task_work / critical_path
 ```
 
-This schedule is derived from measured node weights; it is not an additional
-executed run. It describes potential DAG parallelism under the assumption of
-unlimited task resources.
+Selected outputs are `task_work_ms`, `critical_path_ms`, task-duration
+statistics, and the average, peak, p50, p95, and CV of `P(t)`. This is a
+measured-weight DAG model, not a real execution trace and not a pure topology
+property.
 
-Selected outputs are:
+The public path is `derived_metrics.parallelism`. It is available only with
+profiling and serialization enabled. Multiple DAGs are also evaluated as an
+ideal disjoint union beginning at modeled time zero.
+
+## Actual Task Concurrency
+
+Normal execution leaves task serialization disabled. Profiling records the
+unchanged CUDASTF schedule without otherwise selecting a different execution
+mode.
+
+For every measured sample and task set:
 
 ```text
-W_measured              measured task work
-L_weighted              weighted critical path
-P_average               average DAG parallelism
-P_peak                  peak DAG parallelism
-P_p50/p95               time-weighted parallelism quantiles
-P_cv                    temporal variation of parallelism
-task duration stats     mean, median, p95, and CV of d_i^measured
+task_work       = sum duration_i
+GPU_span        = max(finish_i) - min(start_i)
+C(t)            = count(i where start_i <= t < finish_i)
+GPU_average     = task_work / GPU_span
 ```
 
-The public analysis path is `derived_metrics.parallelism`. It is available
-only when task profiling and task serialization are both enabled. Normal
-profiled runs retain their raw task intervals but do not produce these metrics.
+`Task GPU span` begins at the first profiled task GPU operation and ends at the
+last. Its concurrency distribution includes internal periods with no active
+task. Average concurrency may therefore be less than one.
 
-## Runtime Schedule
+Each DAG receives its own Task GPU span. Combined concurrency preserves all
+DAGs on their real CUPTI timeline, so overlap between DAGs is retained.
 
-This layer executes the unchanged DAG with normal CUDASTF scheduling and task
-serialization disabled. Profiling must not otherwise alter scheduling.
-
-Two measurement modes remain distinct:
+The combined result also has an `End-to-end span`:
 
 ```text
-T_exec(r)          DAG makespan with task profiling disabled
-d_i^runtime(r)     profiled duration of task i
-W_runtime(r)       sum d_i^runtime(r)
-T_profile(r)       makespan of the same profiled run
-C(t,r)             actual active task intervals at time t
+end_to_end_span       = dag_makespan_ms from the same profiled sample
+extra_zero_time       = end_to_end_span - GPU_span
+end_to_end_average    = task_work / end_to_end_span
 ```
 
-`T_exec` is the authoritative end-to-end execution latency. `T_profile` and
-all `C(t,r)` values come from one profiled execution and are never mixed with
-timing from another sample.
+`dag_makespan_ms` is a CUDA event duration from the synchronized boundary
+before submission through the final CUDASTF fence. It is not timestamp-aligned
+with CUPTI. The fence makes it an enclosing execution duration; aggregate
+time-weighted statistics require only the total `extra_zero_time`, which is
+added to the zero-concurrency bucket.
 
-For every profiled run:
+If End-to-end span is non-positive or shorter than Task GPU span, that sample's
+End-to-end result is unavailable. Its Task GPU result remains valid. There is
+no per-DAG End-to-end span because the current measurement provides only one
+boundary for the complete sample.
 
-```text
-average C(t,r) = W_runtime(r) / T_profile(r)
-integral C(t,r) over the trace = W_runtime(r)
-```
-
-The integral identity is a trace acceptance check. Selected concurrency
-outputs are average, peak, p50, p95, and CV of `C(t,r)`, plus the distribution
-of `d_i^runtime(r)`. These results will live at
-`derived_metrics.concurrency`.
-
-Performance comparisons use matching workload and environment identities:
-
-```text
-task completion rate    N / T_exec
-effective parallelism   W_measured / T_exec
-latency stretch         T_exec / L_weighted
-parallelism efficiency  L_weighted / T_exec
-
-task inflation_i        d_i^runtime / d_i^measured
-work inflation          W_runtime / W_measured
-work efficiency         W_measured / W_runtime
-observed concurrency    W_runtime / T_profile
-```
-
-`W_runtime / T_profile` can increase when tasks slow down under contention.
-`W_measured / T_exec` is therefore reported separately as useful measured task
-work completed per unit of unprofiled execution time.
-
-The first task waiting metric is:
-
-```text
-start_delay_i = start_i - dag_eligible_i
-```
-
-Selected scheduling metrics are start-delay median and p95, plus average and
-peak DAG-eligible-but-not-started tasks. The term `start_delay` is deliberate:
-it may include runtime data constraints, scheduler delay, and resource waiting.
-
-## Multi-GPU Comparison
-
-Per-device task metrics are:
-
-```text
-N_d                 tasks assigned to device d
-W_measured,d        sum d_i^measured assigned to device d
-W_runtime,d         sum d_i^runtime executed on device d
-measured_balance    max(W_measured,d) / mean(W_measured,d)
-runtime_balance     max(W_runtime,d) / mean(W_runtime,d)
-remote_edges        edges crossing configured devices
-remote_tasks        tasks with at least one remote predecessor
-```
-
-A balance ratio of 1 is even. Raw per-device values accompany every ratio so
-idle or lightly loaded devices remain visible.
-
-Scaling compares otherwise identical normal runs:
-
-```text
-speedup_G      T_exec,1GPU / T_exec,GPU
-efficiency_G   speedup_G / G
-```
-
-`efficiency_G` is used only for homogeneous selected GPUs. Actual transfer
-count, bytes, and overlap are not inferred from remote edges.
+Selected per-sample outputs are `task_work_ms`, task-duration statistics, and
+complete concurrency statistics for both spans where available. The public
+path is `derived_metrics.concurrency`. It stores every measured sample, then
+reports the across-sample median and nearest-rank p95 of every scalar. Sample
+timelines are never merged.
 
 ## Storage And Integrity
 
-Raw run JSON retains configuration, environment provenance, expanded DAGs,
-task placement, all measured samples, and all public task-profiler fields.
-Derived analysis JSON contains topology and reproducible derived metrics.
+Raw run JSON schema 3 retains configuration, environment provenance, expanded
+DAGs, placement, measured performance samples, and all public task-profiler
+fields. Analysis JSON schema 4 contains topology and reproducible derived
+metrics.
 
 Offline analysis recomputes topology, workload, execution, environment, and
-raw-data hashes before deriving metrics. Serialized and normal runs may be
-compared only when workload and environment hashes match. GPU UUID is retained
-as provenance but excluded from same-model environment compatibility.
+raw-data hashes before deriving metrics. Per-task normal durations remain in
+raw JSON and are not duplicated in concurrency analysis. GPU UUID remains raw
+provenance but is excluded from same-model environment compatibility.
 
-## Device Operations
+## Deferred Analysis
 
-Device-operation analysis is deferred until task-level results require deeper
-explanation. Its intended scope includes GPU utilization, SM active time,
-memory throughput, PCIe or NVLink throughput, kernel and copy duration,
-operation concurrency, and computation/communication overlap.
-
-Task intervals and GPU-operation intervals remain separate: one task may
-launch multiple kernels or copies. Device-operation metrics must not be mixed
-into topology, weighted DAG parallelism, or task concurrency definitions.
+The current schema does not implement paired-run comparisons, task inflation,
+effective parallelism, start delay, per-device concurrency or balance, scaling,
+or device-operation metrics. Those require separate input pairing, clock
+correlation, or operation-level design. They must not be inferred from the
+current topology, potential-parallelism, or task-concurrency fields.

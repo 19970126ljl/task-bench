@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1003,6 +1004,58 @@ SampleResult make_profile_sample(
   return sample;
 }
 
+SampleResult make_runtime_profile_sample(
+    const std::vector<ExpandedDag> &dags,
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> &intervals,
+    double end_to_end_ms, bool reverse_order)
+{
+  std::size_t task_count = 0;
+  for (const ExpandedDag &dag : dags) task_count += dag.tasks.size();
+  if (task_count != intervals.size()) {
+    throw std::logic_error("runtime profile fixture interval count mismatch");
+  }
+
+  SampleResult sample;
+  sample.performance.dag_makespan_ms = end_to_end_ms;
+  sample.task_profile.emplace();
+  TaskProfileContext context;
+  context.context_id = 23;
+  context.task_serialization = CudaFeatureState::disabled;
+  context.task_count = task_count;
+  sample.task_profile->contexts.push_back(context);
+
+  std::size_t index = 0;
+  for (const ExpandedDag &dag : dags) {
+    for (const DagTask &dag_task : dag.tasks) {
+      const auto interval = intervals.at(index);
+      TaskProfileRecord task;
+      task.key = {dag_task.coordinates.dag_index,
+                  dag_task.coordinates.timestep,
+                  dag_task.coordinates.point};
+      task.configured_device = static_cast<int>(index % 2);
+      task.context_id = 23;
+      task.task_id = static_cast<int>(index + 1);
+      task.symbol = "runtime-fixture";
+      task.has_gpu_activity = true;
+      task.start_ns = interval.first;
+      task.end_ns = interval.second;
+      task.elapsed_ms =
+          static_cast<double>(interval.second - interval.first) / 1.0e6;
+      task.operation_count = 1;
+      task.device_timings.push_back(
+          {task.configured_device, task.start_ns, task.end_ns,
+           task.elapsed_ms, 1});
+      sample.task_profile->tasks.push_back(std::move(task));
+      ++index;
+    }
+  }
+  if (reverse_order) {
+    std::reverse(sample.task_profile->tasks.begin(),
+                 sample.task_profile->tasks.end());
+  }
+  return sample;
+}
+
 struct ProfileAssociationFixture {
   TaskActivitySample activity;
   ExpectedProfileTasks expected;
@@ -1179,7 +1232,8 @@ void test_derived_parallelism_metrics()
       metrics.tasks[2].measured_duration_ms != 3.0) {
     throw std::runtime_error("measured task median mismatch");
   }
-  expect_near("measured work", metrics.parallelism.work_ms, 9.0);
+  expect_near(
+      "measured work", metrics.parallelism.task_work_ms, 9.0);
   expect_near(
       "weighted critical path", metrics.parallelism.critical_path_ms, 5.0);
   expect_near("DAG parallelism average", metrics.parallelism.average, 1.8);
@@ -1238,8 +1292,9 @@ void test_derived_parallelism_metrics()
   append_tasks(independent, {4.0, 1.0});
   const ParallelismMetrics &combined =
       derive_metrics(config, {chain, independent}, {combined_sample})
-          .parallelism.combined_parallelism;
-  expect_near("combined measured work", combined.work_ms, 10.0);
+          .parallelism.combined.parallelism;
+  expect_near(
+      "combined measured work", combined.task_work_ms, 10.0);
   expect_near("combined weighted critical path",
               combined.critical_path_ms, 5.0);
   expect_near("combined DAG parallelism average", combined.average, 2.0);
@@ -1251,7 +1306,7 @@ void test_derived_parallelism_metrics()
 
   RunConfig normal = config;
   normal.task_serialization = CudaFeatureState::disabled;
-  if (derive_metrics(normal, {dag}, samples).parallelism.available) {
+  if (derive_metrics(normal, {dag}, {}).parallelism.available) {
     throw std::runtime_error(
         "normal profiled execution produced DAG parallelism metrics");
   }
@@ -1263,6 +1318,142 @@ void test_derived_parallelism_metrics()
   if (first_hash ==
       compute_raw_data_hash("w", "e", "environment", changed)) {
     throw std::runtime_error("raw data hash ignored task timing");
+  }
+}
+
+void test_derived_concurrency_metrics()
+{
+  const ExpandedDag dag = make_layered_dag({2});
+  RunConfig config;
+  config.task_profiler = CudaFeatureState::enabled;
+  config.task_serialization = CudaFeatureState::disabled;
+  const SampleResult gapped = make_runtime_profile_sample(
+      {dag}, {{UINT64_C(1000000), UINT64_C(3000000)},
+              {UINT64_C(6000000), UINT64_C(8000000)}},
+      10.0, false);
+  const SampleResult overlapping = make_runtime_profile_sample(
+      {dag}, {{UINT64_C(1000000001), UINT64_C(1004000001)},
+              {UINT64_C(1001000001), UINT64_C(1005000001)}},
+      8.0, true);
+
+  const ConcurrencyAnalysis &analysis =
+      derive_metrics(config, {dag}, {gapped, overlapping}).concurrency;
+  if (!analysis.available || analysis.samples.size() != 2 ||
+      analysis.summary.sample_count != 2) {
+    throw std::runtime_error("concurrency analysis is unavailable");
+  }
+  const CombinedConcurrencyMetrics &first =
+      analysis.samples[0].combined;
+  expect_near("runtime task work", first.task_work_ms, 4.0);
+  expect_near("Task GPU span", first.task_gpu_span.duration_ms, 7.0);
+  expect_near("Task GPU average", first.task_gpu_span.average, 4.0 / 7.0);
+  if (first.task_gpu_span.peak != 1) {
+    throw std::runtime_error("Task GPU peak mismatch");
+  }
+  expect_near("Task GPU p50", first.task_gpu_span.p50, 1.0);
+  expect_near("Task GPU p95", first.task_gpu_span.p95, 1.0);
+  expect_near("Task GPU CV", first.task_gpu_span.cv, std::sqrt(3.0) / 2.0);
+  if (!first.end_to_end_span.available) {
+    throw std::runtime_error("End-to-end span is unavailable");
+  }
+  const ConcurrencyMetrics &end_to_end =
+      first.end_to_end_span.metrics;
+  expect_near("End-to-end span", end_to_end.duration_ms, 10.0);
+  expect_near("End-to-end average", end_to_end.average, 0.4);
+  expect_near("End-to-end p50", end_to_end.p50, 0.0);
+  expect_near("End-to-end p95", end_to_end.p95, 1.0);
+  expect_near("End-to-end CV", end_to_end.cv, std::sqrt(1.5));
+
+  const CombinedConcurrencySummary &summary = analysis.summary.combined;
+  expect_near("summary task work median", summary.task_work_ms.median, 6.0);
+  expect_near("summary task work p95", summary.task_work_ms.p95, 8.0);
+  expect_near(
+      "summary Task GPU span median",
+      summary.task_gpu_span.duration_ms.median, 6.0);
+  expect_near(
+      "summary Task GPU peak median",
+      summary.task_gpu_span.peak.median, 1.5);
+  if (!summary.end_to_end_span.available) {
+    throw std::runtime_error("End-to-end summary is unavailable");
+  }
+  expect_near(
+      "summary End-to-end span median",
+      summary.end_to_end_span.metrics.duration_ms.median, 9.0);
+
+  SampleResult invalid_end_to_end = gapped;
+  invalid_end_to_end.performance.dag_makespan_ms = 6.0;
+  const ConcurrencyAnalysis &partial =
+      derive_metrics(config, {dag}, {invalid_end_to_end}).concurrency;
+  if (!partial.available ||
+      partial.samples[0].combined.end_to_end_span.available ||
+      partial.summary.combined.end_to_end_span.available) {
+    throw std::runtime_error(
+        "invalid End-to-end span discarded valid Task GPU metrics");
+  }
+  expect_near(
+      "partial Task GPU span",
+      partial.samples[0].combined.task_gpu_span.duration_ms, 7.0);
+
+  SampleResult inactive = gapped;
+  TaskProfileRecord &inactive_task = inactive.task_profile->tasks[0];
+  inactive_task.has_gpu_activity = false;
+  inactive_task.start_ns = 0;
+  inactive_task.end_ns = 0;
+  inactive_task.elapsed_ms = 0.0;
+  inactive_task.operation_count = 0;
+  inactive_task.device_timings.clear();
+  const ConcurrencyAnalysis &inactive_analysis =
+      derive_metrics(config, {dag}, {inactive}).concurrency;
+  if (inactive_analysis.available ||
+      inactive_analysis.unavailable_reason.find("no correlated GPU activity") ==
+          std::string::npos) {
+    throw std::runtime_error(
+        "inactive runtime task produced concurrency metrics");
+  }
+
+  const SampleResult adjacent = make_runtime_profile_sample(
+      {dag}, {{UINT64_C(1000), UINT64_C(2001000)},
+              {UINT64_C(2001000), UINT64_C(4001000)}},
+      5.0, false);
+  const ConcurrencyMetrics &adjacent_span =
+      derive_metrics(config, {dag}, {adjacent})
+          .concurrency.samples[0].combined.task_gpu_span;
+  expect_near("adjacent Task GPU average", adjacent_span.average, 1.0);
+  if (adjacent_span.peak != 1) {
+    throw std::runtime_error("half-open task intervals overlap at boundary");
+  }
+
+  ExpandedDag second_dag = make_layered_dag({1});
+  second_dag.task_graph.graph_index = 1;
+  for (DagTask &task : second_dag.tasks) {
+    task.coordinates.dag_index = 1;
+  }
+  ExpandedDag first_dag = make_layered_dag({1});
+  const SampleResult cross_dag = make_runtime_profile_sample(
+      {first_dag, second_dag},
+      {{UINT64_C(1000), UINT64_C(10001000)},
+       {UINT64_C(1000), UINT64_C(10001000)}},
+      11.0, false);
+  const ConcurrencyAnalysis &cross_dag_analysis =
+      derive_metrics(
+          config, {first_dag, second_dag}, {cross_dag}).concurrency;
+  if (cross_dag_analysis.samples[0].dags[0].task_gpu_span.peak != 1 ||
+      cross_dag_analysis.samples[0].dags[1].task_gpu_span.peak != 1 ||
+      cross_dag_analysis.samples[0].combined.task_gpu_span.peak != 2) {
+    throw std::runtime_error("combined DAG concurrency lost real overlap");
+  }
+
+  RunConfig serialized = config;
+  serialized.task_serialization = CudaFeatureState::enabled;
+  if (derive_metrics(serialized, {dag}, {}).concurrency.available) {
+    throw std::runtime_error(
+        "serialized execution produced concurrency metrics");
+  }
+  RunConfig unprofiled = config;
+  unprofiled.task_profiler = CudaFeatureState::disabled;
+  if (derive_metrics(unprofiled, {dag}, {gapped}).concurrency.available) {
+    throw std::runtime_error(
+        "unprofiled execution produced concurrency metrics");
   }
 }
 
@@ -1282,6 +1473,7 @@ int main()
     test_statistics();
     test_task_profile_association();
     test_derived_parallelism_metrics();
+    test_derived_concurrency_metrics();
     std::cout << "CUDASTF host unit tests passed\n";
     return 0;
   } catch (const std::exception &error) {

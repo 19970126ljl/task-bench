@@ -354,7 +354,7 @@ def parallelism_statistics(intervals):
         for value, duration in duration_by_value.items()
     ) / critical_path
     return {
-        "work_ms": work,
+        "task_work_ms": work,
         "critical_path_ms": critical_path,
         "average": average,
         "peak": peak,
@@ -366,6 +366,111 @@ def parallelism_statistics(intervals):
 
 def unavailable_parallelism(reason):
     return {"status": "unavailable", "reason": reason}
+
+
+def unavailable_concurrency(reason):
+    return {"status": "unavailable", "reason": reason}
+
+
+def concurrency_histogram(intervals):
+    if not intervals:
+        raise ValueError("concurrency interval set is empty")
+    events = {}
+    task_work_ns = 0
+    for start_ns, end_ns in intervals:
+        if end_ns <= start_ns:
+            raise ValueError("runtime task duration is not positive")
+        task_work_ns += end_ns - start_ns
+        events[start_ns] = events.get(start_ns, 0) + 1
+        events[end_ns] = events.get(end_ns, 0) - 1
+
+    timestamps = sorted(events)
+    task_gpu_span_ns = timestamps[-1] - timestamps[0]
+    if task_gpu_span_ns <= 0:
+        raise ValueError("Task GPU span is not positive")
+
+    duration_by_concurrency = {}
+    peak = 0
+    active = 0
+    previous_ns = timestamps[0]
+    for timestamp in timestamps:
+        duration_ns = timestamp - previous_ns
+        if duration_ns > 0:
+            if active < 0:
+                raise ValueError("invalid concurrency interval events")
+            duration_by_concurrency[active] = (
+                duration_by_concurrency.get(active, 0) + duration_ns
+            )
+            peak = max(peak, active)
+        active += events[timestamp]
+        if active < 0:
+            raise ValueError("invalid concurrency interval events")
+        previous_ns = timestamp
+    if active != 0:
+        raise ValueError("unbalanced concurrency interval events")
+    return {
+        "task_work_ns": task_work_ns,
+        "task_gpu_span_ns": task_gpu_span_ns,
+        "peak": peak,
+        "duration_by_concurrency": duration_by_concurrency,
+    }
+
+
+def concurrency_span(histogram, duration_ms, duration_ns=None):
+    if not math.isfinite(duration_ms) or duration_ms <= 0.0:
+        raise ValueError("concurrency span is not positive")
+    if duration_ns is None:
+        duration_ns = duration_ms * 1.0e6
+    task_gpu_span_ns = histogram["task_gpu_span_ns"]
+    if duration_ns < task_gpu_span_ns:
+        raise ValueError("concurrency span is shorter than Task GPU span")
+
+    duration_by_concurrency = dict(histogram["duration_by_concurrency"])
+    duration_by_concurrency[0] = (
+        duration_by_concurrency.get(0, 0.0)
+        + duration_ns - task_gpu_span_ns
+    )
+    average = histogram["task_work_ns"] / duration_ns
+
+    def weighted_quantile(fraction):
+        threshold = fraction * duration_ns
+        cumulative = 0.0
+        for value in sorted(duration_by_concurrency):
+            cumulative += duration_by_concurrency[value]
+            if cumulative >= threshold:
+                return float(value)
+        return float(max(duration_by_concurrency))
+
+    variance = sum(
+        duration * (value - average) ** 2
+        for value, duration in duration_by_concurrency.items()
+    ) / duration_ns
+    return {
+        "duration_ms": duration_ms,
+        "average": average,
+        "peak": histogram["peak"],
+        "p50": weighted_quantile(0.50),
+        "p95": weighted_quantile(0.95),
+        "cv": math.sqrt(variance) / average if average else 0.0,
+    }
+
+
+def scalar_summary(values):
+    return {"median": median(values), "p95": nearest_rank(values, 0.95)}
+
+
+def duration_statistics_summary(values):
+    return {
+        name: scalar_summary([value[name] for value in values])
+        for name in ("mean_ms", "median_ms", "p95_ms", "cv")
+    }
+
+
+def concurrency_span_summary(values):
+    return {
+        name: scalar_summary([value[name] for value in values])
+        for name in ("duration_ms", "average", "peak", "p50", "p95", "cv")
+    }
 
 
 def analyze_parallelism(run):
@@ -520,6 +625,221 @@ def analyze_parallelism(run):
     }
 
 
+def analyze_concurrency(run):
+    config = run["run_config"]
+    if (config["task_profiler"] != "enabled" or
+            config["task_serialization"] != "disabled"):
+        return unavailable_concurrency(
+            "concurrency requires task profiler enabled and task serialization disabled"
+        )
+    samples = run["samples"]
+    if not samples:
+        return unavailable_concurrency("concurrency requires measured samples")
+
+    expected = {}
+    dag_tasks = {}
+    for dag in run["dags"]:
+        dag_tasks[dag["dag_index"]] = dag["task_table"]
+        for task in dag["task_table"]:
+            key = task_key(task)
+            if key in expected:
+                raise ValueError(f"duplicate logical task {key}")
+            expected[key] = task
+
+    configured_devices = {}
+    sample_results = []
+    for sample_index, sample in enumerate(samples):
+        profile = sample["task_profile"]
+        if profile is None:
+            raise ValueError("profiled sample has no task profile")
+        contexts = profile["contexts"]
+        if (len(contexts) != 1 or
+                contexts[0]["task_serialization"] != "disabled"):
+            raise ValueError(
+                "concurrency sample is not marked as normal execution"
+            )
+        if len(profile["tasks"]) != len(expected):
+            raise ValueError("profiled sample task count mismatch")
+        if contexts[0]["task_count"] != len(expected):
+            raise ValueError("profiled context task count mismatch")
+
+        runtime_ids = set()
+        tasks_by_key = {}
+        for task in profile["tasks"]:
+            key = task_key(task)
+            runtime_id = (task["context_id"], task["task_id"])
+            if task["context_id"] != contexts[0]["context_id"]:
+                raise ValueError("task context id mismatch")
+            if runtime_id in runtime_ids:
+                raise ValueError("duplicate context/task id")
+            runtime_ids.add(runtime_id)
+            if key not in expected or key in tasks_by_key:
+                raise ValueError(f"unknown or duplicate logical task {key}")
+            if task["configured_device"] != expected[key]["configured_device"]:
+                raise ValueError(f"configured device mismatch for task {key}")
+            previous_device = configured_devices.setdefault(
+                key, task["configured_device"]
+            )
+            if previous_device != task["configured_device"]:
+                raise ValueError(f"configured device changed for task {key}")
+            if not task["has_gpu_activity"]:
+                return unavailable_concurrency(
+                    "one or more tasks have no correlated GPU activity"
+                )
+            start_ns = task["start_ns"]
+            end_ns = task["end_ns"]
+            if end_ns <= start_ns or task["operation_count"] <= 0:
+                return unavailable_concurrency(
+                    "one or more tasks have a non-positive GPU duration"
+                )
+            expected_elapsed = (end_ns - start_ns) / 1.0e6
+            if not math.isclose(
+                task["elapsed_ms"], expected_elapsed,
+                rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise ValueError(f"elapsed time mismatch for task {key}")
+            if len(task["device_timings"]) != 1:
+                raise ValueError(f"unexpected device timing count for task {key}")
+            device = task["device_timings"][0]
+            if device["device_id"] != task["configured_device"]:
+                raise ValueError(f"observed device mismatch for task {key}")
+            if (device["end_ns"] <= device["start_ns"] or
+                    device["operation_count"] <= 0):
+                raise ValueError(f"invalid device timing for task {key}")
+            device_elapsed = (
+                device["end_ns"] - device["start_ns"]
+            ) / 1.0e6
+            if not math.isclose(
+                device["elapsed_ms"], device_elapsed,
+                rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise ValueError(f"device elapsed time mismatch for task {key}")
+            if device["operation_count"] != task["operation_count"]:
+                raise ValueError(f"device operation count mismatch for task {key}")
+            tasks_by_key[key] = task
+        if set(tasks_by_key) != set(expected):
+            raise ValueError("profile is missing logical tasks")
+
+        dag_results = []
+        combined_durations = []
+        combined_intervals = []
+        for dag in run["dags"]:
+            durations = []
+            intervals = []
+            for logical_task in dag_tasks[dag["dag_index"]]:
+                task = tasks_by_key[task_key(logical_task)]
+                duration_ms = (task["end_ns"] - task["start_ns"]) / 1.0e6
+                interval = (task["start_ns"], task["end_ns"])
+                durations.append(duration_ms)
+                intervals.append(interval)
+                combined_durations.append(duration_ms)
+                combined_intervals.append(interval)
+            histogram = concurrency_histogram(intervals)
+            task_gpu_span_ms = histogram["task_gpu_span_ns"] / 1.0e6
+            dag_results.append(
+                {
+                    "dag_index": dag["dag_index"],
+                    "task_work_ms": histogram["task_work_ns"] / 1.0e6,
+                    "task_duration": duration_statistics(durations),
+                    "task_gpu_span": concurrency_span(
+                        histogram, task_gpu_span_ms,
+                        histogram["task_gpu_span_ns"],
+                    ),
+                }
+            )
+
+        combined_histogram = concurrency_histogram(combined_intervals)
+        combined_task_gpu_span_ms = (
+            combined_histogram["task_gpu_span_ns"] / 1.0e6
+        )
+        end_to_end_ms = sample["dag_makespan_ms"]
+        if not math.isfinite(end_to_end_ms) or end_to_end_ms <= 0.0:
+            end_to_end_span = unavailable_concurrency(
+                "End-to-end span is not positive"
+            )
+        elif end_to_end_ms * 1.0e6 < combined_histogram["task_gpu_span_ns"]:
+            end_to_end_span = unavailable_concurrency(
+                "End-to-end span is shorter than Task GPU span"
+            )
+        else:
+            end_to_end_span = {
+                "status": "available",
+                **concurrency_span(combined_histogram, end_to_end_ms),
+            }
+        sample_results.append(
+            {
+                "sample_index": sample_index,
+                "dags": dag_results,
+                "combined": {
+                    "task_work_ms": (
+                        combined_histogram["task_work_ns"] / 1.0e6
+                    ),
+                    "task_duration": duration_statistics(combined_durations),
+                    "task_gpu_span": concurrency_span(
+                        combined_histogram, combined_task_gpu_span_ms,
+                        combined_histogram["task_gpu_span_ns"],
+                    ),
+                    "end_to_end_span": end_to_end_span,
+                },
+            }
+        )
+
+    dag_summaries = []
+    for dag_index, dag in enumerate(run["dags"]):
+        values = [sample["dags"][dag_index] for sample in sample_results]
+        if any(value["dag_index"] != dag["dag_index"] for value in values):
+            raise ValueError("DAG order changed across concurrency samples")
+        dag_summaries.append(
+            {
+                "dag_index": dag["dag_index"],
+                "task_work_ms": scalar_summary(
+                    [value["task_work_ms"] for value in values]
+                ),
+                "task_duration": duration_statistics_summary(
+                    [value["task_duration"] for value in values]
+                ),
+                "task_gpu_span": concurrency_span_summary(
+                    [value["task_gpu_span"] for value in values]
+                ),
+            }
+        )
+
+    combined_values = [sample["combined"] for sample in sample_results]
+    end_to_end_values = [
+        value["end_to_end_span"] for value in combined_values
+    ]
+    if all(value["status"] == "available" for value in end_to_end_values):
+        end_to_end_summary = {
+            "status": "available",
+            **concurrency_span_summary(end_to_end_values),
+        }
+    else:
+        end_to_end_summary = unavailable_concurrency(
+            "one or more samples have an unavailable End-to-end span"
+        )
+    return {
+        "status": "available",
+        "duration_definition": "gpu_activity_envelope",
+        "samples": sample_results,
+        "summary": {
+            "sample_count": len(sample_results),
+            "dags": dag_summaries,
+            "combined": {
+                "task_work_ms": scalar_summary(
+                    [value["task_work_ms"] for value in combined_values]
+                ),
+                "task_duration": duration_statistics_summary(
+                    [value["task_duration"] for value in combined_values]
+                ),
+                "task_gpu_span": concurrency_span_summary(
+                    [value["task_gpu_span"] for value in combined_values]
+                ),
+                "end_to_end_span": end_to_end_summary,
+            },
+        },
+    }
+
+
 def analyze(run):
     if run.get("format") != "cudastf-task-bench-run":
         raise ValueError("input is not a CUDASTF Task Bench run JSON")
@@ -548,7 +868,7 @@ def analyze(run):
     topology = analyze_topology(run["dags"])
     return {
         "format": "cudastf-task-bench-analysis",
-        "schema_version": 3,
+        "schema_version": 4,
         "backend": "cudastf",
         "source": {
             "task_bench_revision": run["task_bench_revision"],
@@ -568,6 +888,7 @@ def analyze(run):
         "topology": topology,
         "derived_metrics": {
             "parallelism": analyze_parallelism(run),
+            "concurrency": analyze_concurrency(run),
         },
     }
 

@@ -228,6 +228,9 @@ profile_common=(
 python3 "$script_dir/analyze.py" \
   --input "$test_tmp/profile-serialized.json" \
   --output "$test_tmp/profile-serialized-offline.json"
+python3 "$script_dir/analyze.py" \
+  --input "$test_tmp/profile-normal.json" \
+  --output "$test_tmp/profile-normal-offline.json"
 python3 - "$test_tmp" <<'PY'
 import json
 import math
@@ -257,6 +260,7 @@ serial = load("profile-serial.json")
 normal = load("profile-normal.json")
 profiled_serial = load("profile-serialized.json")
 normal_analysis = load("profile-normal-analysis.json")
+normal_offline = load("profile-normal-offline.json")
 online = load("profile-serialized-analysis.json")
 offline = load("profile-serialized-offline.json")
 warmup = load("profile-warmup.json")
@@ -272,9 +276,24 @@ assert all(sample["task_profile"] is None
            for document in (base, serial) for sample in document["samples"])
 assert normal_analysis["derived_metrics"]["parallelism"]["status"] == \
        "unavailable"
+assert normal_analysis["derived_metrics"]["concurrency"]["status"] == \
+       "available"
+assert len(normal_analysis["derived_metrics"]["concurrency"]["samples"]) == \
+       normal["run_config"]["measured_samples"]
+assert normal_analysis["derived_metrics"]["concurrency"]["summary"] \
+       ["sample_count"] == normal["run_config"]["measured_samples"]
+for sample in normal_analysis["derived_metrics"]["concurrency"]["samples"]:
+    combined = sample["combined"]
+    assert combined["end_to_end_span"]["status"] == "available"
+    assert combined["task_gpu_span"]["duration_ms"] <= \
+           combined["end_to_end_span"]["duration_ms"]
 assert online["derived_metrics"]["parallelism"]["status"] == "available"
+assert online["derived_metrics"]["concurrency"]["status"] == "unavailable"
 assert_equivalent(online["derived_metrics"], offline["derived_metrics"])
+assert_equivalent(normal_analysis["derived_metrics"],
+                  normal_offline["derived_metrics"])
 assert_equivalent(online["topology"], offline["topology"])
+assert_equivalent(normal_analysis["topology"], normal_offline["topology"])
 assert online["source"]["raw_data_hash"] == offline["source"]["raw_data_hash"]
 assert online["source"]["environment_hash"] == \
        offline["source"]["environment_hash"]
@@ -293,15 +312,27 @@ assert len(warmup["samples"]) == 1
 assert len(warmup["samples"][0]["task_profile"]["tasks"]) == 4
 assert warmup_analysis["derived_metrics"]["parallelism"]["status"] == \
        "available"
+assert warmup_analysis["derived_metrics"]["concurrency"]["status"] == \
+       "unavailable"
 PY
 
 grep -F "Median serialized collection makespan:" \
   "$test_tmp/profile-serialized.out" >/dev/null
-grep -F "Measured task work:" "$test_tmp/profile-serialized.out" >/dev/null
+grep -F "Potential DAG parallelism (serialized task durations):" \
+  "$test_tmp/profile-serialized.out" >/dev/null
+grep -F "Task work:" "$test_tmp/profile-serialized.out" >/dev/null
 grep -F "Weighted critical path:" \
   "$test_tmp/profile-serialized.out" >/dev/null
 grep -F "DAG parallelism: average" \
   "$test_tmp/profile-serialized.out" >/dev/null
+grep -F "Actual task concurrency (normal execution, across-sample medians):" \
+  "$test_tmp/profile-normal.out" >/dev/null
+grep -F "Task GPU span:" "$test_tmp/profile-normal.out" >/dev/null
+grep -F "Task GPU concurrency: average" \
+  "$test_tmp/profile-normal.out" >/dev/null
+grep -F "End-to-end span:" "$test_tmp/profile-normal.out" >/dev/null
+grep -F "End-to-end concurrency: average" \
+  "$test_tmp/profile-normal.out" >/dev/null
 if grep -F "Median DAG makespan:" \
     "$test_tmp/profile-serialized.out" >/dev/null; then
   echo "serialized collection reported a normal DAG makespan" >&2
@@ -435,7 +466,7 @@ jq -e '
 
 jq -e '
   .format == "cudastf-task-bench-analysis" and
-  .schema_version == 3 and
+  .schema_version == 4 and
   .backend == "cudastf" and
   (.source.task_bench_revision | length) > 0 and
   (.source.task_bench_worktree_dirty | type) == "boolean" and
@@ -457,7 +488,8 @@ jq -e '
   .topology.dags[0].parallelism.p95 == 8 and
   .topology.dags[0].parallelism.cv == 0 and
   .topology.combined == (.topology.dags[0] | del(.dag_index)) and
-  .derived_metrics.parallelism.status == "unavailable"
+  .derived_metrics.parallelism.status == "unavailable" and
+  .derived_metrics.concurrency.status == "unavailable"
 ' "$test_tmp/analysis-a.json" >/dev/null
 
 topology_a=$(jq -r '.dags[0].topology_hash' "$test_tmp/result-a.json")
@@ -696,19 +728,51 @@ if [[ -n $max_device ]] && ((max_device >= 1)); then
     -cuda-task-serialization disabled \
     -cuda-warmup 0 -cuda-runs 1 \
     -cuda-json "$test_tmp/profile-multi-gpu-normal.json" \
+    -cuda-analysis-json "$test_tmp/profile-multi-gpu-normal-analysis.json" \
     >"$test_tmp/profile-multi-gpu-normal.out" 2>&1
-  python3 - "$test_tmp/profile-multi-gpu-normal.json" <<'PY'
+  python3 "$script_dir/analyze.py" \
+    --input "$test_tmp/profile-multi-gpu-normal.json" \
+    --output "$test_tmp/profile-multi-gpu-normal-offline.json"
+  python3 - "$test_tmp/profile-multi-gpu-normal.json" \
+    "$test_tmp/profile-multi-gpu-normal-analysis.json" \
+    "$test_tmp/profile-multi-gpu-normal-offline.json" <<'PY'
 import json
+import math
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     run = json.load(source)
+with open(sys.argv[2], encoding="utf-8") as source:
+    online = json.load(source)
+with open(sys.argv[3], encoding="utf-8") as source:
+    offline = json.load(source)
 tasks = run["samples"][0]["task_profile"]["tasks"]
 assert len(tasks) == 2
 left, right = tasks
 overlap_ns = min(left["end_ns"], right["end_ns"]) - \
              max(left["start_ns"], right["start_ns"])
 assert overlap_ns > 0, f"expected normal task overlap, got {overlap_ns} ns"
+concurrency = online["derived_metrics"]["concurrency"]
+assert concurrency["status"] == "available"
+assert concurrency["samples"][0]["combined"]["task_gpu_span"]["peak"] > 1
+assert concurrency["samples"][0]["combined"]["end_to_end_span"]["status"] \
+       == "available"
+
+def equivalent(left_value, right_value):
+    if isinstance(left_value, dict):
+        return left_value.keys() == right_value.keys() and all(
+            equivalent(left_value[key], right_value[key]) for key in left_value
+        )
+    if isinstance(left_value, list):
+        return len(left_value) == len(right_value) and all(
+            equivalent(left_item, right_item)
+            for left_item, right_item in zip(left_value, right_value)
+        )
+    if isinstance(left_value, float) or isinstance(right_value, float):
+        return math.isclose(left_value, right_value, rel_tol=1e-13, abs_tol=1e-15)
+    return left_value == right_value
+
+assert equivalent(online["derived_metrics"], offline["derived_metrics"])
 PY
 
   run_case multi_gpu_memory_and \

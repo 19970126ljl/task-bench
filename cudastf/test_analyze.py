@@ -171,9 +171,58 @@ def make_run():
     return run
 
 
+def set_sample_intervals(sample, intervals, dag_makespan_ms, origin_ns):
+    by_task_id = {task["task_id"]: task for task in sample["task_profile"]["tasks"]}
+    for task_id, (start_ns, end_ns) in enumerate(intervals, 1):
+        task = by_task_id[task_id]
+        elapsed_ms = (end_ns - start_ns) / 1.0e6
+        task["start_ns"] = start_ns
+        task["end_ns"] = end_ns
+        task["elapsed_ms"] = elapsed_ms
+        device = task["device_timings"][0]
+        device["start_ns"] = start_ns
+        device["end_ns"] = end_ns
+        device["elapsed_ms"] = elapsed_ms
+    profile = sample["task_profile"]
+    profile["cupti_timestamp_origin_ns"] = origin_ns
+    context = profile["contexts"][0]
+    context["task_serialization"] = "disabled"
+    context["start_ns"] = min(start for start, _ in intervals)
+    context["end_ns"] = max(end for _, end in intervals)
+    context["elapsed_ms"] = (
+        context["end_ns"] - context["start_ns"]
+    ) / 1.0e6
+    sample["dag_makespan_ms"] = dag_makespan_ms
+
+
+def make_normal_run():
+    run = make_run()
+    run["run_config"]["task_serialization"] = "disabled"
+    set_sample_intervals(
+        run["samples"][0],
+        [(1_000_000, 3_000_000),
+         (6_000_000, 8_000_000),
+         (8_000_000, 10_000_000)],
+        12.0,
+        100,
+    )
+    set_sample_intervals(
+        run["samples"][1],
+        [(1_000_000_001, 1_004_000_001),
+         (1_001_000_001, 1_005_000_001),
+         (1_004_000_001, 1_008_000_001)],
+        10.0,
+        1_000_000_000_000,
+    )
+    run["execution_config_hash"] = analyze.compute_execution_config_hash(run)
+    run["raw_data_hash"] = analyze.compute_raw_data_hash(run)
+    return run
+
+
 class AnalyzeTest(unittest.TestCase):
     def test_parallelism_and_topology(self):
         result = analyze.analyze(make_run())
+        self.assertEqual(result["schema_version"], 4)
         self.assertEqual(result["topology"]["dags"][0]["critical_path_length"], 2)
         parallelism_analysis = result["derived_metrics"]["parallelism"]
         self.assertEqual(parallelism_analysis["status"], "available")
@@ -185,7 +234,7 @@ class AnalyzeTest(unittest.TestCase):
             [2.0, 4.0, 3.0],
         )
         parallelism = parallelism_analysis["dags"][0]["parallelism"]
-        self.assertAlmostEqual(parallelism["work_ms"], 9.0)
+        self.assertAlmostEqual(parallelism["task_work_ms"], 9.0)
         self.assertAlmostEqual(parallelism["critical_path_ms"], 5.0)
         self.assertAlmostEqual(parallelism["average"], 1.8)
         self.assertEqual(parallelism["peak"], 2)
@@ -201,15 +250,65 @@ class AnalyzeTest(unittest.TestCase):
             analyze.analyze(changed)
 
     def test_normal_profile_has_no_parallelism_analysis(self):
-        run = make_run()
-        run["run_config"]["task_serialization"] = "disabled"
-        run["execution_config_hash"] = analyze.compute_execution_config_hash(run)
-        run["raw_data_hash"] = analyze.compute_raw_data_hash(run)
+        run = make_normal_run()
         result = analyze.analyze(run)
         self.assertEqual(
             result["derived_metrics"]["parallelism"]["status"],
             "unavailable",
         )
+
+    def test_normal_concurrency(self):
+        run = make_normal_run()
+        run["run_config"]["warmup_samples"] = 3
+        result = analyze.analyze(run)
+        concurrency = result["derived_metrics"]["concurrency"]
+        self.assertEqual(concurrency["status"], "available")
+        self.assertEqual(len(concurrency["samples"]), 2)
+        self.assertEqual(concurrency["summary"]["sample_count"], 2)
+
+        first = concurrency["samples"][0]["combined"]
+        self.assertAlmostEqual(first["task_work_ms"], 6.0)
+        self.assertAlmostEqual(first["task_gpu_span"]["duration_ms"], 9.0)
+        self.assertAlmostEqual(first["task_gpu_span"]["average"], 2.0 / 3.0)
+        self.assertEqual(first["task_gpu_span"]["peak"], 1)
+        self.assertEqual(first["task_gpu_span"]["p50"], 1.0)
+        self.assertEqual(first["end_to_end_span"]["status"], "available")
+        self.assertAlmostEqual(first["end_to_end_span"]["average"], 0.5)
+        self.assertEqual(first["end_to_end_span"]["p50"], 0.0)
+
+        summary = concurrency["summary"]["combined"]
+        self.assertAlmostEqual(summary["task_work_ms"]["median"], 9.0)
+        self.assertAlmostEqual(summary["task_work_ms"]["p95"], 12.0)
+        self.assertAlmostEqual(summary["task_gpu_span"]["peak"]["median"], 1.5)
+        self.assertEqual(summary["end_to_end_span"]["status"], "available")
+        self.assertAlmostEqual(
+            summary["end_to_end_span"]["duration_ms"]["median"], 11.0
+        )
+
+    def test_short_end_to_end_span_preserves_gpu_metrics(self):
+        run = make_normal_run()
+        run["samples"][0]["dag_makespan_ms"] = 8.0
+        run["raw_data_hash"] = analyze.compute_raw_data_hash(run)
+        concurrency = analyze.analyze(run)["derived_metrics"]["concurrency"]
+        self.assertEqual(concurrency["status"], "available")
+        self.assertEqual(
+            concurrency["samples"][0]["combined"]["end_to_end_span"]["status"],
+            "unavailable",
+        )
+
+    def test_normal_task_without_gpu_activity_is_unavailable(self):
+        run = make_normal_run()
+        task = run["samples"][0]["task_profile"]["tasks"][0]
+        task["has_gpu_activity"] = False
+        task["start_ns"] = 0
+        task["end_ns"] = 0
+        task["elapsed_ms"] = 0.0
+        task["operation_count"] = 0
+        task["device_timings"] = []
+        run["raw_data_hash"] = analyze.compute_raw_data_hash(run)
+        concurrency = analyze.analyze(run)["derived_metrics"]["concurrency"]
+        self.assertEqual(concurrency["status"], "unavailable")
+        self.assertIn("no correlated GPU activity", concurrency["reason"])
 
     def test_duplicate_logical_task_is_rejected(self):
         run = make_run()

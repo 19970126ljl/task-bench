@@ -255,7 +255,7 @@ void write_duration_statistics(
 void write_parallelism_metrics(
     std::ostream &out, const ParallelismMetrics &metrics)
 {
-  out << "{\"work_ms\":" << metrics.work_ms
+  out << "{\"task_work_ms\":" << metrics.task_work_ms
       << ",\"critical_path_ms\":" << metrics.critical_path_ms
       << ",\"average\":" << metrics.average
       << ",\"peak\":" << metrics.peak
@@ -297,9 +297,188 @@ void write_parallelism_analysis(
     out << "}";
   }
   out << "],\"combined\":{\"task_duration\":";
-  write_duration_statistics(out, analysis.combined_task_duration);
+  write_duration_statistics(out, analysis.combined.task_duration);
   out << ",\"parallelism\":";
-  write_parallelism_metrics(out, analysis.combined_parallelism);
+  write_parallelism_metrics(out, analysis.combined.parallelism);
+  out << "}}";
+}
+
+void write_concurrency_metrics(
+    std::ostream &out, const ConcurrencyMetrics &metrics)
+{
+  out << "{\"duration_ms\":" << metrics.duration_ms
+      << ",\"average\":" << metrics.average
+      << ",\"peak\":" << metrics.peak
+      << ",\"p50\":" << metrics.p50
+      << ",\"p95\":" << metrics.p95
+      << ",\"cv\":" << metrics.cv << "}";
+}
+
+void write_end_to_end_span(
+    std::ostream &out, const EndToEndSpanMetrics &span)
+{
+  if (!span.available) {
+    out << "{\"status\":\"unavailable\",\"reason\":\""
+        << json_escape(span.unavailable_reason) << "\"}";
+    return;
+  }
+  out << "{\"status\":\"available\",";
+  out << "\"duration_ms\":" << span.metrics.duration_ms
+      << ",\"average\":" << span.metrics.average
+      << ",\"peak\":" << span.metrics.peak
+      << ",\"p50\":" << span.metrics.p50
+      << ",\"p95\":" << span.metrics.p95
+      << ",\"cv\":" << span.metrics.cv << "}";
+}
+
+void write_dag_concurrency(
+    std::ostream &out, const DagConcurrencyMetrics &metrics)
+{
+  out << "{\"dag_index\":" << metrics.dag_index
+      << ",\"task_work_ms\":" << metrics.task_work_ms
+      << ",\"task_duration\":";
+  write_duration_statistics(out, metrics.task_duration);
+  out << ",\"task_gpu_span\":";
+  write_concurrency_metrics(out, metrics.task_gpu_span);
+  out << "}";
+}
+
+void write_combined_concurrency(
+    std::ostream &out, const CombinedConcurrencyMetrics &metrics)
+{
+  out << "{\"task_work_ms\":" << metrics.task_work_ms
+      << ",\"task_duration\":";
+  write_duration_statistics(out, metrics.task_duration);
+  out << ",\"task_gpu_span\":";
+  write_concurrency_metrics(out, metrics.task_gpu_span);
+  out << ",\"end_to_end_span\":";
+  write_end_to_end_span(out, metrics.end_to_end_span);
+  out << "}";
+}
+
+void write_scalar_summary(
+    std::ostream &out, const ScalarSummary &summary)
+{
+  out << "{\"median\":" << summary.median
+      << ",\"p95\":" << summary.p95 << "}";
+}
+
+void write_duration_statistics_summary(
+    std::ostream &out, const DurationStatisticsSummary &summary)
+{
+  out << "{\"mean_ms\":";
+  write_scalar_summary(out, summary.mean_ms);
+  out << ",\"median_ms\":";
+  write_scalar_summary(out, summary.median_ms);
+  out << ",\"p95_ms\":";
+  write_scalar_summary(out, summary.p95_ms);
+  out << ",\"cv\":";
+  write_scalar_summary(out, summary.cv);
+  out << "}";
+}
+
+void write_concurrency_metrics_summary(
+    std::ostream &out, const ConcurrencyMetricsSummary &summary)
+{
+  out << "{\"duration_ms\":";
+  write_scalar_summary(out, summary.duration_ms);
+  out << ",\"average\":";
+  write_scalar_summary(out, summary.average);
+  out << ",\"peak\":";
+  write_scalar_summary(out, summary.peak);
+  out << ",\"p50\":";
+  write_scalar_summary(out, summary.p50);
+  out << ",\"p95\":";
+  write_scalar_summary(out, summary.p95);
+  out << ",\"cv\":";
+  write_scalar_summary(out, summary.cv);
+  out << "}";
+}
+
+void write_end_to_end_span_summary(
+    std::ostream &out, const EndToEndSpanSummary &summary)
+{
+  if (!summary.available) {
+    out << "{\"status\":\"unavailable\",\"reason\":\""
+        << json_escape(summary.unavailable_reason) << "\"}";
+    return;
+  }
+  out << "{\"status\":\"available\",";
+  out << "\"duration_ms\":";
+  write_scalar_summary(out, summary.metrics.duration_ms);
+  out << ",\"average\":";
+  write_scalar_summary(out, summary.metrics.average);
+  out << ",\"peak\":";
+  write_scalar_summary(out, summary.metrics.peak);
+  out << ",\"p50\":";
+  write_scalar_summary(out, summary.metrics.p50);
+  out << ",\"p95\":";
+  write_scalar_summary(out, summary.metrics.p95);
+  out << ",\"cv\":";
+  write_scalar_summary(out, summary.metrics.cv);
+  out << "}";
+}
+
+void write_dag_concurrency_summary(
+    std::ostream &out, const DagConcurrencySummary &summary)
+{
+  out << "{\"dag_index\":" << summary.dag_index
+      << ",\"task_work_ms\":";
+  write_scalar_summary(out, summary.task_work_ms);
+  out << ",\"task_duration\":";
+  write_duration_statistics_summary(out, summary.task_duration);
+  out << ",\"task_gpu_span\":";
+  write_concurrency_metrics_summary(out, summary.task_gpu_span);
+  out << "}";
+}
+
+void write_combined_concurrency_summary(
+    std::ostream &out, const CombinedConcurrencySummary &summary)
+{
+  out << "{\"task_work_ms\":";
+  write_scalar_summary(out, summary.task_work_ms);
+  out << ",\"task_duration\":";
+  write_duration_statistics_summary(out, summary.task_duration);
+  out << ",\"task_gpu_span\":";
+  write_concurrency_metrics_summary(out, summary.task_gpu_span);
+  out << ",\"end_to_end_span\":";
+  write_end_to_end_span_summary(out, summary.end_to_end_span);
+  out << "}";
+}
+
+void write_concurrency_analysis(
+    std::ostream &out, const ConcurrencyAnalysis &analysis)
+{
+  if (!analysis.available) {
+    out << "{\"status\":\"unavailable\",\"reason\":\""
+        << json_escape(analysis.unavailable_reason) << "\"}";
+    return;
+  }
+
+  out << "{\"status\":\"available\""
+      << ",\"duration_definition\":\"gpu_activity_envelope\""
+      << ",\"samples\":[";
+  for (std::size_t i = 0; i < analysis.samples.size(); ++i) {
+    if (i != 0) out << ",";
+    const ConcurrencySampleMetrics &sample = analysis.samples[i];
+    out << "{\"sample_index\":" << sample.sample_index
+        << ",\"dags\":[";
+    for (std::size_t j = 0; j < sample.dags.size(); ++j) {
+      if (j != 0) out << ",";
+      write_dag_concurrency(out, sample.dags[j]);
+    }
+    out << "],\"combined\":";
+    write_combined_concurrency(out, sample.combined);
+    out << "}";
+  }
+  out << "],\"summary\":{\"sample_count\":"
+      << analysis.summary.sample_count << ",\"dags\":[";
+  for (std::size_t i = 0; i < analysis.summary.dags.size(); ++i) {
+    if (i != 0) out << ",";
+    write_dag_concurrency_summary(out, analysis.summary.dags[i]);
+  }
+  out << "],\"combined\":";
+  write_combined_concurrency_summary(out, analysis.summary.combined);
   out << "}}";
 }
 
@@ -658,14 +837,47 @@ void print_report(const RunConfig &run_config,
   }
   if (derived_metrics.parallelism.available) {
     const ParallelismMetrics &combined =
-        derived_metrics.parallelism.combined_parallelism;
-    std::cout << "  Measured task work: " << combined.work_ms << " ms\n"
-              << "  Weighted critical path: "
+        derived_metrics.parallelism.combined.parallelism;
+    std::cout
+              << "  Potential DAG parallelism (serialized task durations):\n"
+              << "    Task work: " << combined.task_work_ms << " ms\n"
+              << "    Weighted critical path: "
               << combined.critical_path_ms << " ms\n"
-              << "  DAG parallelism: average "
+              << "    DAG parallelism: average "
               << combined.average << ", peak " << combined.peak
               << ", p50 " << combined.p50 << ", p95 "
               << combined.p95 << ", CV " << combined.cv << "\n";
+  }
+  if (derived_metrics.concurrency.available) {
+    const CombinedConcurrencySummary &combined =
+        derived_metrics.concurrency.summary.combined;
+    std::cout
+        << "  Actual task concurrency (normal execution, "
+           "across-sample medians):\n"
+        << "    Task work: " << combined.task_work_ms.median << " ms\n"
+        << "    Task GPU span: "
+        << combined.task_gpu_span.duration_ms.median << " ms\n"
+        << "    Task GPU concurrency: average "
+        << combined.task_gpu_span.average.median << ", peak "
+        << combined.task_gpu_span.peak.median << ", p50 "
+        << combined.task_gpu_span.p50.median << ", p95 "
+        << combined.task_gpu_span.p95.median << ", CV "
+        << combined.task_gpu_span.cv.median << "\n";
+    if (combined.end_to_end_span.available) {
+      const ConcurrencyMetricsSummary &end_to_end =
+          combined.end_to_end_span.metrics;
+      std::cout << "    End-to-end span: "
+                << end_to_end.duration_ms.median << " ms\n"
+                << "    End-to-end concurrency: average "
+                << end_to_end.average.median << ", peak "
+                << end_to_end.peak.median << ", p50 "
+                << end_to_end.p50.median << ", p95 "
+                << end_to_end.p95.median << ", CV "
+                << end_to_end.cv.median << "\n";
+    } else {
+      std::cout << "    End-to-end concurrency unavailable: "
+                << combined.end_to_end_span.unavailable_reason << "\n";
+    }
   }
 }
 
@@ -874,7 +1086,7 @@ void write_analysis_json(
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
       << "  \"format\":\"cudastf-task-bench-analysis\",\n"
-      << "  \"schema_version\":3,\n"
+      << "  \"schema_version\":4,\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"source\":{\"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION)
@@ -904,6 +1116,8 @@ void write_analysis_json(
   write_topology_metric_fields(out, topology_metrics.combined);
   out << "}},\n  \"derived_metrics\":{\"parallelism\":";
   write_parallelism_analysis(out, derived_metrics.parallelism);
+  out << ",\"concurrency\":";
+  write_concurrency_analysis(out, derived_metrics.concurrency);
   out << "}\n}\n";
 
   if (!out) {

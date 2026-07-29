@@ -66,7 +66,8 @@ Task serialization and profiling are independent and default to `disabled`.
 Serialization calls CUDASTF `set_task_serialization()` and changes scheduling;
 profiling collects task GPU activity without changing that setting. In
 particular, normal profiled runs provide task traces, while profiled and
-serialized runs provide isolated measured task durations.
+serialized runs provide measured task durations without inter-task GPU
+overlap.
 
 ## Workloads
 
@@ -97,7 +98,8 @@ submission and data ownership are defined in [`main.cu`](main.cu).
 
 ## Results
 
-Console output includes execution timing and derived topology metrics.
+Console output includes execution timing, topology metrics, and any derived
+task metrics enabled by the run configuration.
 `-cuda-json` records configuration, the complete expanded DAG, placement,
 identities, raw samples, and all public CUDASTF profiler fields.
 `-cuda-analysis-json` writes topology and derived metrics separately. Warmups
@@ -112,9 +114,24 @@ path and potential DAG parallelism under a model with unlimited task resources.
 CUDASTF-managed acquisition and automatic data movement before the task body
 are serialized but are outside this profiler interval.
 
-The serialized run's `dag_makespan_ms` is the cost of collecting isolated task
-measurements, not a performance baseline. Normal runs continue to report it as
-the end-to-end DAG makespan.
+The serialized run's `dag_makespan_ms` is the cost of collecting task
+measurements without inter-task GPU overlap, not a performance baseline.
+Normal runs continue to report it as the end-to-end DAG makespan.
+
+A normal profiled sample also derives actual task concurrency. `Task GPU span`
+is the interval from the first profiled task GPU operation to the last and
+includes internal zero-concurrency gaps. `End-to-end span` is the same sample's
+`dag_makespan_ms`; time outside Task GPU span is included in its zero-
+concurrency bucket. Both spans report average, peak, time-weighted p50/p95, and
+CV. Task work is the sum of task GPU-envelope durations, so it can exceed both
+span durations when tasks overlap. Task GPU average can be less than one when
+the trace contains idle gaps.
+
+`derived_metrics.parallelism` is available for profiled serialized runs.
+`derived_metrics.concurrency` is available for profiled normal runs and keeps
+every measured sample separate before reporting across-sample median and p95
+summaries. End-to-end metrics are combined-only because the backend currently
+records one end-to-end boundary for the complete sample.
 
 Analysis can be regenerated without a GPU:
 
@@ -123,14 +140,14 @@ python3 cudastf/analyze.py --input run.json --output analysis.json
 ```
 
 The analyzer recomputes and validates topology, workload, execution,
-environment, and raw-data hashes before deriving metrics. Analysis output uses
-`derived_metrics.parallelism`; normal profiled traces leave that entry
-unavailable and are retained for later `derived_metrics.concurrency` analysis.
-GPU UUIDs remain in raw provenance but do not affect same-model environment
-compatibility.
+environment, and raw-data hashes before deriving metrics. Raw run JSON uses
+schema 3 and analysis JSON uses schema 4. GPU UUIDs remain in raw provenance
+but do not affect same-model environment compatibility.
 
-`DAG makespan` is the CUDA event interval from the synchronized boundary before
-submission to the final CUDASTF fence. JSON field definitions are emitted by
+`DAG makespan` is the CUDA event duration from the synchronized boundary before
+submission to the final CUDASTF fence. CUPTI task timestamps use a separate
+origin; only intervals within one task profile are directly timestamp-aligned.
+JSON field definitions are emitted by
 [`results.cc`](results.cc); topology and execution identities are defined in
 [`identity.cc`](identity.cc).
 
