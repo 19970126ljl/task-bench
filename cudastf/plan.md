@@ -10,7 +10,10 @@ schedule affect execution performance. The implemented metric layers are:
   needed to fill it;
 - potential parallelism: an ideal ASAP model weighted by serialized task
   measurements;
-- actual concurrency: task overlap observed in a normal CUDASTF execution.
+- actual concurrency: task overlap observed in a normal CUDASTF execution;
+- cross-mode comparison: task efficiency, concurrency versus parallelism, and
+  ideal versus actual execution time for compatible serialized and normal
+  profiled runs.
 
 Task profiling and task serialization are independent controls. Potential
 parallelism requires both controls enabled. Actual concurrency requires task
@@ -189,10 +192,78 @@ participate in the raw-data hash. Per-task normal durations remain in raw JSON
 and are not duplicated in concurrency analysis. GPU UUID remains raw provenance
 but is excluded from same-model environment compatibility.
 
+## Cross-Mode Comparison
+
+Cross-mode metrics use two independent raw run JSON inputs: one profiled run
+with task serialization enabled and one profiled normal run. Both inputs are
+first validated by the regular offline analyzer. Pairing additionally requires
+equal workload and environment hashes, DAG order and topology, logical task
+keys and configured devices, and kernel capacity. Measured sample counts may
+differ.
+
+Serialized observations produce one median duration per logical task. No
+serialized sample is paired with a normal sample. For each normal sample:
+
+```text
+d_i^serialized = median serialized GPU-envelope duration for task i
+d_i^normal     = GPU-envelope duration for task i in this normal sample
+
+W_serialized   = sum d_i^serialized
+W_normal       = sum d_i^normal
+T_ideal        = ideal ASAP DAG time using d_i^serialized
+P              = W_serialized / T_ideal
+C_gpu          = W_normal / Task_GPU_span
+C_end_to_end   = W_normal / End_to_end_span
+
+task_duration_efficiency_i = d_i^serialized / d_i^normal
+task_work_efficiency       = W_serialized / W_normal
+task_gpu_span.concurrency_to_parallelism = C_gpu / P
+end_to_end_span.concurrency_to_parallelism = C_end_to_end / P
+task_gpu_span.ideal_to_actual_time = T_ideal / Task_GPU_span
+end_to_end_span.ideal_to_actual_time = T_ideal / End_to_end_span
+```
+
+Normal execution contributes measured durations, spans, and concurrency only;
+it does not create a modeled normal critical path. The two decompositions are:
+
+```text
+task_gpu_span.ideal_to_actual_time =
+    task_work_efficiency * task_gpu_span.concurrency_to_parallelism
+end_to_end_span.ideal_to_actual_time =
+    task_work_efficiency * end_to_end_span.concurrency_to_parallelism
+```
+
+The public comparison schema uses `task_work.efficiency`,
+`span.concurrency_to_parallelism`, and `span.ideal_to_actual_time` for these
+ratios. Per-DAG Task GPU spans and the combined Task GPU span use integer CUPTI
+timestamps from each normal sample. End-to-end results are combined-only. If
+any sample has an unavailable End-to-end span, its Task GPU metrics remain
+valid but the End-to-end summary is unavailable.
+
+Every normal sample retains per-DAG and combined task work, ideal time, average
+parallelism, actual span time, average concurrency, and the two higher-is-
+better ratios. Across-sample summaries report median and nearest-rank p95.
+Task details retain the stable task key and configured device, serialized
+median duration, normal duration median/p95, and duration-efficiency median/p95.
+Ratios are not clamped.
+
+The standalone command is:
+
+```sh
+python3 cudastf/compare.py \
+  --serialized serialized-run.json \
+  --normal normal-run.json \
+  --output comparison.json
+```
+
+The output uses format `cudastf-task-bench-comparison` and schema 1. It records
+both source raw-data hashes but does not modify or replace either raw run or its
+single-run analysis.
+
 ## Deferred Analysis
 
-The current schema does not implement paired-run comparisons, task inflation,
-effective parallelism, start delay, per-device concurrency or balance, scaling,
-or device-operation metrics. Those require separate input pairing, clock
-correlation, or operation-level design. They must not be inferred from the
-current topology, potential-parallelism, or task-concurrency fields.
+The current schemas do not implement span stretch, effective parallelism,
+start delay, per-device interference or balance, scaling, utilization, or
+device-operation metrics. Those require additional semantic design, clock
+correlation, or operation-level data. They must not be inferred from the
+current topology, potential-parallelism, task-concurrency, or cross-mode fields.

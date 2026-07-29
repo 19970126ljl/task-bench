@@ -89,6 +89,7 @@ FORCE:
 test: $(TARGET) $(UNIT_TEST)
 	$(UNIT_TEST)
 	python3 test_analyze.py
+	python3 test_compare.py
 	./test.sh
 
 $(OBJECTS) unit_test.o $(CORE_OBJECTS): $(BUILD_CONFIG_STAMP)

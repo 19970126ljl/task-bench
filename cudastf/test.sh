@@ -231,6 +231,10 @@ python3 "$script_dir/analyze.py" \
 python3 "$script_dir/analyze.py" \
   --input "$test_tmp/profile-normal.json" \
   --output "$test_tmp/profile-normal-offline.json"
+python3 "$script_dir/compare.py" \
+  --serialized "$test_tmp/profile-serialized.json" \
+  --normal "$test_tmp/profile-normal.json" \
+  --output "$test_tmp/profile-comparison.json"
 python3 - "$test_tmp" <<'PY'
 import json
 import math
@@ -265,6 +269,7 @@ online = load("profile-serialized-analysis.json")
 offline = load("profile-serialized-offline.json")
 warmup = load("profile-warmup.json")
 warmup_analysis = load("profile-warmup-analysis.json")
+comparison = load("profile-comparison.json")
 
 assert len({document["workload_config_hash"] for document in
             (base, serial, normal, profiled_serial)}) == 1
@@ -317,6 +322,50 @@ assert warmup_analysis["derived_metrics"]["parallelism"]["status"] == \
        "available"
 assert warmup_analysis["derived_metrics"]["concurrency"]["status"] == \
        "unavailable"
+assert comparison["format"] == "cudastf-task-bench-comparison"
+assert comparison["schema_version"] == 1
+assert comparison["source"]["workload_config_hash"] == \
+       normal["workload_config_hash"]
+assert comparison["source"]["environment_hash"] == \
+       normal["environment_hash"]
+assert comparison["source"]["serialized"]["raw_data_hash"] == \
+       profiled_serial["raw_data_hash"]
+assert comparison["source"]["normal"]["raw_data_hash"] == \
+       normal["raw_data_hash"]
+assert len(comparison["tasks"]) == 4
+assert len(comparison["samples"]) == \
+       normal["run_config"]["measured_samples"]
+assert comparison["summary"]["sample_count"] == \
+       normal["run_config"]["measured_samples"]
+for sample in comparison["samples"]:
+    for metrics in sample["dags"] + [sample["combined"]]:
+        assert metrics["task_work"]["efficiency"] > 0
+        assert metrics["ideal_time_ms"] > 0
+        assert metrics["average_parallelism"] > 0
+        task_gpu = metrics["task_gpu_span"]
+        assert task_gpu["actual_time_ms"] > 0
+        assert task_gpu["average_concurrency"] > 0
+        assert task_gpu["concurrency_to_parallelism"] > 0
+        assert task_gpu["ideal_to_actual_time"] > 0
+        assert math.isclose(
+            task_gpu["ideal_to_actual_time"],
+            metrics["task_work"]["efficiency"] *
+            task_gpu["concurrency_to_parallelism"],
+            rel_tol=1e-13,
+            abs_tol=1e-15,
+        )
+    assert sample["combined"]["end_to_end_span"]["status"] == \
+           "available"
+    end_to_end = sample["combined"]["end_to_end_span"]
+    assert math.isclose(
+        end_to_end["ideal_to_actual_time"],
+        sample["combined"]["task_work"]["efficiency"] *
+        end_to_end["concurrency_to_parallelism"],
+        rel_tol=1e-13,
+        abs_tol=1e-15,
+    )
+assert comparison["summary"]["combined"] \
+       ["end_to_end_span"]["status"] == "available"
 PY
 
 grep -F "Median serialized collection makespan:" \

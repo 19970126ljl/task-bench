@@ -154,6 +154,41 @@ environment, and raw-data hashes before deriving metrics. Raw run JSON uses
 schema 4 and analysis JSON uses schema 5. GPU UUIDs remain in raw provenance
 but do not affect same-model environment compatibility.
 
+Compare a profiled serialized run with a separate profiled normal run:
+
+```sh
+python3 cudastf/compare.py \
+  --serialized serialized-run.json \
+  --normal normal-run.json \
+  --output comparison.json
+```
+
+The inputs must have matching workload and environment identities, DAGs, task
+placement, and kernel capacity. Their measured sample counts may differ.
+Serialized samples are reduced to one median duration per task; every normal
+sample is then analyzed independently, so sample indices are never paired
+across execution modes.
+
+The serialized task durations define `ideal_time_ms`, the weighted ideal DAG
+time, and `average_parallelism`. Normal execution directly supplies Task GPU
+and End-to-end spans and their average concurrency; it does not construct a
+second modeled critical path. For each normal sample, comparison JSON reports:
+
+```text
+task_work.efficiency                 = serialized work / normal work
+span.concurrency_to_parallelism      = normal concurrency / DAG parallelism
+span.ideal_to_actual_time            = ideal time / actual span time
+```
+
+All three ratios use a higher-is-better direction and are not clamped. They
+obey `ideal_to_actual_time = task work efficiency * concurrency to
+parallelism`. Task-level duration efficiency similarly uses serialized task
+duration divided by normal task duration. Task GPU results are available per
+DAG and combined; End-to-end results are combined-only and become unavailable
+in the summary if any normal sample has an unavailable End-to-end span.
+Comparison JSON uses the independent `cudastf-task-bench-comparison` format
+with schema 1; the two raw run files remain its authoritative inputs.
+
 `DAG makespan` is the CUDA event duration from the synchronized boundary before
 submission to the final CUDASTF fence. CUPTI task timestamps use a separate
 origin; only intervals within one task profile are directly timestamp-aligned.

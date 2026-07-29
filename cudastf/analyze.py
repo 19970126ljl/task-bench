@@ -408,6 +408,34 @@ def duration_statistics(values):
     }
 
 
+def model_asap_intervals(tasks, duration_by_task):
+    finishes = {}
+    intervals = []
+    for task in tasks:
+        key = task_key(task)
+        if key not in duration_by_task:
+            raise ValueError(f"missing duration for task {key}")
+        duration = duration_by_task[key]
+        if duration <= 0:
+            raise ValueError(f"task duration is not positive for task {key}")
+        start = 0
+        for predecessor in task["predecessors"]:
+            predecessor_key = (
+                task["dag_index"],
+                predecessor["timestep"],
+                predecessor["point"],
+            )
+            if predecessor_key not in finishes:
+                raise ValueError(
+                    f"missing or unordered predecessor {predecessor_key}"
+                )
+            start = max(start, finishes[predecessor_key])
+        finish = start + duration
+        finishes[key] = finish
+        intervals.append((start, finish))
+    return intervals
+
+
 def parallelism_statistics(intervals):
     events = {}
     work = 0.0
@@ -667,29 +695,13 @@ def analyze_parallelism(run):
     combined_durations = []
     combined_intervals = []
     for dag in run["dags"]:
-        finishes = {}
         task_results = []
         durations = []
-        intervals = []
         for task in dag["task_table"]:
             key = task_key(task)
-            start = 0.0
-            for predecessor in task["predecessors"]:
-                predecessor_key = (
-                    task["dag_index"],
-                    predecessor["timestep"],
-                    predecessor["point"],
-                )
-                if predecessor_key not in finishes:
-                    raise ValueError(f"missing or unordered predecessor {predecessor_key}")
-                start = max(start, finishes[predecessor_key])
             duration = measured_duration[key]
-            finish = start + duration
-            finishes[key] = finish
             durations.append(duration)
-            intervals.append((start, finish))
             combined_durations.append(duration)
-            combined_intervals.append((start, finish))
             task_results.append(
                 {
                     "dag_index": key[0],
@@ -699,6 +711,10 @@ def analyze_parallelism(run):
                     "measured_duration_ms": duration,
                 }
             )
+        intervals = model_asap_intervals(
+            dag["task_table"], measured_duration
+        )
+        combined_intervals.extend(intervals)
         dag_results.append(
             {
                 "dag_index": dag["dag_index"],
