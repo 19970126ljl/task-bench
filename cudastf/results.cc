@@ -482,6 +482,34 @@ void write_concurrency_analysis(
   out << "}}";
 }
 
+void write_kernel_capacity(
+    std::ostream &out, const KernelCapacityMetrics &capacity)
+{
+  out << "{\"dags\":[";
+  for (std::size_t i = 0; i < capacity.dags.size(); ++i) {
+    if (i != 0) out << ",";
+    const DagKernelCapacity &dag = capacity.dags[i];
+    out << "{\"dag_index\":" << dag.dag_index << ",\"devices\":[";
+    for (std::size_t j = 0; j < dag.devices.size(); ++j) {
+      if (j != 0) out << ",";
+      const DeviceKernelCapacity &device = dag.devices[j];
+      out << "{\"device_id\":" << device.device_id
+          << ",\"sm_count\":" << device.sm_count
+          << ",\"max_active_blocks_per_sm\":"
+          << device.max_active_blocks_per_sm
+          << ",\"resident_blocks\":" << device.resident_blocks
+          << ",\"occupancy_saturation_tasks\":"
+          << device.occupancy_saturation_tasks << "}";
+    }
+    out << "],\"combined\":{\"device_count\":"
+        << dag.combined.device_count
+        << ",\"resident_blocks\":" << dag.combined.resident_blocks
+        << ",\"occupancy_saturation_tasks\":"
+        << dag.combined.occupancy_saturation_tasks << "}}";
+  }
+  out << "]}";
+}
+
 void print_topology_metrics(const char *indent,
                             const DagTopologyMetrics &metrics)
 {
@@ -680,6 +708,38 @@ void validate_topology_metrics(
   }
 }
 
+void validate_kernel_capacity(
+    const std::vector<ExpandedDag> &expanded_dags,
+    const KernelCapacityMetrics &capacity)
+{
+  if (capacity.dags.size() != expanded_dags.size()) {
+    throw std::logic_error("kernel capacity count does not match DAG count");
+  }
+  for (std::size_t i = 0; i < capacity.dags.size(); ++i) {
+    const DagKernelCapacity &dag = capacity.dags[i];
+    if (dag.dag_index != expanded_dags[i].dag_index() ||
+        dag.devices.empty() ||
+        dag.combined.device_count != dag.devices.size()) {
+      throw std::logic_error("invalid DAG kernel capacity result");
+    }
+    std::uint64_t resident_blocks = 0;
+    std::uint64_t saturation_tasks = 0;
+    for (const DeviceKernelCapacity &device : dag.devices) {
+      resident_blocks = checked_add(
+          resident_blocks, device.resident_blocks,
+          "combined resident block count");
+      saturation_tasks = checked_add(
+          saturation_tasks, device.occupancy_saturation_tasks,
+          "combined occupancy saturation task count");
+    }
+    if (dag.combined.resident_blocks != resident_blocks ||
+        dag.combined.occupancy_saturation_tasks != saturation_tasks) {
+      throw std::logic_error(
+          "combined kernel capacity does not match device metrics");
+    }
+  }
+}
+
 }  // namespace
 
 PerformanceSummary summarize_performance(
@@ -700,6 +760,7 @@ void print_report(const RunConfig &run_config,
                       &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                   const KernelResourcesByDag &kernel_resources,
+                  const KernelCapacityMetrics &kernel_capacity,
                   const TopologyMetrics &topology_metrics,
                   const DerivedMetrics &derived_metrics,
                   const std::string &workload_config_hash,
@@ -711,6 +772,7 @@ void print_report(const RunConfig &run_config,
       expanded_dags, task_iteration_counts, gpu_kernel_configs,
       devices, kernel_resources);
   validate_topology_metrics(expanded_dags, topology_metrics);
+  validate_kernel_capacity(expanded_dags, kernel_capacity);
   const PerformanceSummary summary = summarize_performance(samples);
   std::cout << "CUDASTF Task Bench\n"
             << "  Context: " << run_config.context << "\n"
@@ -800,6 +862,13 @@ void print_report(const RunConfig &run_config,
                 << resources.max_active_blocks_per_sm
                 << "\n";
     }
+    const CombinedKernelCapacity &combined_capacity =
+        kernel_capacity.dags[i].combined;
+    std::cout << "    Occupancy saturation: "
+              << combined_capacity.occupancy_saturation_tasks
+              << " runnable tasks across "
+              << combined_capacity.device_count
+              << (combined_capacity.device_count == 1 ? " GPU\n" : " GPUs\n");
     if (uses_task_scratch(task_graph)) {
       std::cout << "    Scratch: "
                 << task_graph.scratch_bytes_per_task
@@ -905,7 +974,7 @@ void write_run_json(
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
       << "  \"format\":\"cudastf-task-bench-run\",\n"
-      << "  \"schema_version\":3,\n"
+      << "  \"schema_version\":4,\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION) << "\",\n"
@@ -933,7 +1002,8 @@ void write_run_json(
         << json_escape(device.uuid) << "\",\"compute_capability\":\""
         << device.compute_capability_major << "."
         << device.compute_capability_minor
-        << "\",\"legacy_shared_memory_per_block_bytes\":"
+        << "\",\"sm_count\":" << device.sm_count
+        << ",\"legacy_shared_memory_per_block_bytes\":"
         << device.legacy_shared_memory_per_block
         << ",\"optin_shared_memory_per_block_bytes\":"
         << device.optin_shared_memory_per_block << "}";
@@ -1070,6 +1140,7 @@ void write_analysis_json(
     const std::string &path,
     const std::vector<ExpandedDag> &expanded_dags,
     const TopologyMetrics &topology_metrics,
+    const KernelCapacityMetrics &kernel_capacity,
     const DerivedMetrics &derived_metrics,
     const std::string &workload_config_hash,
     const std::string &execution_config_hash,
@@ -1077,6 +1148,7 @@ void write_analysis_json(
     const std::string &raw_data_hash)
 {
   validate_topology_metrics(expanded_dags, topology_metrics);
+  validate_kernel_capacity(expanded_dags, kernel_capacity);
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error(
@@ -1086,7 +1158,7 @@ void write_analysis_json(
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\n"
       << "  \"format\":\"cudastf-task-bench-analysis\",\n"
-      << "  \"schema_version\":4,\n"
+      << "  \"schema_version\":5,\n"
       << "  \"backend\":\"cudastf\",\n"
       << "  \"source\":{\"task_bench_revision\":\""
       << json_escape(TASKBENCH_REVISION)
@@ -1114,7 +1186,9 @@ void write_analysis_json(
   }
   out << "],\"combined\":{";
   write_topology_metric_fields(out, topology_metrics.combined);
-  out << "}},\n  \"derived_metrics\":{\"parallelism\":";
+  out << "}},\n  \"kernel_capacity\":";
+  write_kernel_capacity(out, kernel_capacity);
+  out << ",\n  \"derived_metrics\":{\"parallelism\":";
   write_parallelism_analysis(out, derived_metrics.parallelism);
   out << ",\"concurrency\":";
   write_concurrency_analysis(out, derived_metrics.concurrency);

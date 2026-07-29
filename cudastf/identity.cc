@@ -235,6 +235,7 @@ std::string compute_environment_hash(
     hash.add_string(device.name);
     hash.add_i64(device.compute_capability_major);
     hash.add_i64(device.compute_capability_minor);
+    hash.add_i64(device.sm_count);
   }
   return hash.hex_digest();
 }
@@ -243,6 +244,7 @@ std::string compute_raw_data_hash(
     const std::string &workload_config_hash,
     const std::string &execution_config_hash,
     const std::string &environment_hash,
+    const KernelResourcesByDag &kernel_resources,
     const std::vector<SampleResult> &samples)
 {
   StableHash hash;
@@ -250,6 +252,17 @@ std::string compute_raw_data_hash(
   hash.add_string(workload_config_hash);
   hash.add_string(execution_config_hash);
   hash.add_string(environment_hash);
+  hash.add_u64(kernel_resources.size());
+  for (const std::vector<GpuKernelResources> &dag_resources :
+       kernel_resources) {
+    hash.add_u64(dag_resources.size());
+    for (const GpuKernelResources &resources : dag_resources) {
+      hash.add_i64(resources.device_id);
+      hash.add_i64(resources.registers_per_thread);
+      hash.add_u64(resources.static_shared_memory_bytes);
+      hash.add_i64(resources.max_active_blocks_per_sm);
+    }
+  }
   hash.add_u64(samples.size());
   for (const SampleResult &sample : samples) {
     hash.add_f64(sample.performance.submission_ms);

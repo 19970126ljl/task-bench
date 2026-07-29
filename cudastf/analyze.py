@@ -51,6 +51,16 @@ def compute_raw_data_hash(run):
     hasher.add_string(compute_workload_config_hash(run))
     hasher.add_string(compute_execution_config_hash(run))
     hasher.add_string(compute_environment_hash(run))
+    dags = run["dags"]
+    hasher.add_u64(len(dags))
+    for dag in dags:
+        resources = dag["kernel"]["resources"]
+        hasher.add_u64(len(resources))
+        for resource in resources:
+            hasher.add_i64(resource["device_id"])
+            hasher.add_i64(resource["registers_per_thread"])
+            hasher.add_u64(resource["static_shared_memory_bytes"])
+            hasher.add_i64(resource["max_active_blocks_per_sm"])
     samples = run["samples"]
     hasher.add_u64(len(samples))
     for sample in samples:
@@ -210,6 +220,7 @@ def compute_environment_hash(run):
         major, minor = device["compute_capability"].split(".", 1)
         hasher.add_i64(int(major))
         hasher.add_i64(int(minor))
+        hasher.add_i64(device["sm_count"])
     return hasher.digest()
 
 
@@ -302,6 +313,89 @@ def analyze_topology(dags):
             combined_tasks, combined_edges, combined_widths
         ),
     }
+
+
+def analyze_kernel_capacity(run):
+    devices = run["devices"]
+    devices_by_id = {}
+    for device in devices:
+        device_id = device["device_id"]
+        if device_id in devices_by_id:
+            raise ValueError(f"duplicate CUDA device id {device_id}")
+        if device["sm_count"] <= 0:
+            raise ValueError(f"non-positive SM count for device {device_id}")
+        devices_by_id[device_id] = device
+
+    dag_results = []
+    for dag in run["dags"]:
+        blocks_per_task = dag["kernel"]["launch"]["blocks_per_task"]
+        if blocks_per_task <= 0:
+            raise ValueError("blocks per task is not positive")
+        used_devices = {
+            task["configured_device"] for task in dag["task_table"]
+        }
+        if not used_devices:
+            raise ValueError(f"DAG {dag['dag_index']} has no assigned device")
+
+        resources_by_device = {}
+        for resource in dag["kernel"]["resources"]:
+            device_id = resource["device_id"]
+            if device_id in resources_by_device:
+                raise ValueError(
+                    f"duplicate kernel resource device id {device_id}"
+                )
+            resources_by_device[device_id] = resource
+
+        device_results = []
+        combined_resident_blocks = 0
+        combined_saturation_tasks = 0
+        for device in devices:
+            device_id = device["device_id"]
+            if device_id not in used_devices:
+                continue
+            if device_id not in resources_by_device:
+                raise ValueError(
+                    f"missing kernel resources for device {device_id}"
+                )
+            resource = resources_by_device[device_id]
+            active_blocks = resource["max_active_blocks_per_sm"]
+            if active_blocks <= 0:
+                raise ValueError(
+                    f"non-positive active blocks for device {device_id}"
+                )
+            resident_blocks = device["sm_count"] * active_blocks
+            saturation_tasks = (
+                resident_blocks + blocks_per_task - 1
+            ) // blocks_per_task
+            device_results.append(
+                {
+                    "device_id": device_id,
+                    "sm_count": device["sm_count"],
+                    "max_active_blocks_per_sm": active_blocks,
+                    "resident_blocks": resident_blocks,
+                    "occupancy_saturation_tasks": saturation_tasks,
+                }
+            )
+            combined_resident_blocks += resident_blocks
+            combined_saturation_tasks += saturation_tasks
+        if len(device_results) != len(used_devices):
+            raise ValueError(
+                f"DAG {dag['dag_index']} uses an unknown CUDA device"
+            )
+        dag_results.append(
+            {
+                "dag_index": dag["dag_index"],
+                "devices": device_results,
+                "combined": {
+                    "device_count": len(device_results),
+                    "resident_blocks": combined_resident_blocks,
+                    "occupancy_saturation_tasks": (
+                        combined_saturation_tasks
+                    ),
+                },
+            }
+        )
+    return {"dags": dag_results}
 
 
 def duration_statistics(values):
@@ -843,7 +937,7 @@ def analyze_concurrency(run):
 def analyze(run):
     if run.get("format") != "cudastf-task-bench-run":
         raise ValueError("input is not a CUDASTF Task Bench run JSON")
-    if run.get("schema_version") != 3:
+    if run.get("schema_version") != 4:
         raise ValueError("unsupported run JSON schema version")
     for dag in run["dags"]:
         actual_topology_hash = compute_topology_hash(dag)
@@ -868,7 +962,7 @@ def analyze(run):
     topology = analyze_topology(run["dags"])
     return {
         "format": "cudastf-task-bench-analysis",
-        "schema_version": 4,
+        "schema_version": 5,
         "backend": "cudastf",
         "source": {
             "task_bench_revision": run["task_bench_revision"],
@@ -886,6 +980,7 @@ def analyze(run):
             ],
         },
         "topology": topology,
+        "kernel_capacity": analyze_kernel_capacity(run),
         "derived_metrics": {
             "parallelism": analyze_parallelism(run),
             "concurrency": analyze_concurrency(run),

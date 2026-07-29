@@ -102,9 +102,19 @@ Console output includes execution timing, topology metrics, and any derived
 task metrics enabled by the run configuration.
 `-cuda-json` records configuration, the complete expanded DAG, placement,
 identities, raw samples, and all public CUDASTF profiler fields.
-`-cuda-analysis-json` writes topology and derived metrics separately. Warmups
-are profiled when requested but are never recorded or used for metric
-derivation.
+`-cuda-analysis-json` writes topology, kernel capacity, and derived task
+metrics separately. Warmups are profiled when requested but are never recorded
+or used for metric derivation.
+
+`kernel_capacity` reports occupancy capacity for each DAG on every device that
+receives one of its tasks. CUDA supplies `max_active_blocks_per_sm` for the
+compiled kernel, launch block size, dynamic shared memory, and selected device;
+this calculation accounts for register, shared-memory, thread, warp, and block
+residency limits. `resident_blocks` multiplies that value by the device SM
+count. `occupancy_saturation_tasks` is the number of runnable task kernels
+needed to provide that many blocks, rounded up separately on each GPU before
+combining devices. It is an occupancy-fill threshold, not a maximum task
+concurrency or a performance-utilization denominator.
 
 `measured_duration_ms` uses the same profiler interval as a normal task trace:
 the envelope from the first through the last correlated GPU operation in the
@@ -141,7 +151,7 @@ python3 cudastf/analyze.py --input run.json --output analysis.json
 
 The analyzer recomputes and validates topology, workload, execution,
 environment, and raw-data hashes before deriving metrics. Raw run JSON uses
-schema 3 and analysis JSON uses schema 4. GPU UUIDs remain in raw provenance
+schema 4 and analysis JSON uses schema 5. GPU UUIDs remain in raw provenance
 but do not affect same-model environment compatibility.
 
 `DAG makespan` is the CUDA event duration from the synchronized boundary before

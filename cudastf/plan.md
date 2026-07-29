@@ -1,4 +1,4 @@
-# Task-Level Parallelism And Concurrency Metrics
+# Task-Level Parallelism, Capacity, And Concurrency Metrics
 
 ## Research Objective
 
@@ -6,6 +6,8 @@ Determine how CUDASTF DAG structure, measured task duration, and the runtime
 schedule affect execution performance. The implemented metric layers are:
 
 - topology: DAG structure with unit-cost tasks;
+- kernel capacity: occupancy-based block residency and the runnable task count
+  needed to fill it;
 - potential parallelism: an ideal ASAP model weighted by serialized task
   measurements;
 - actual concurrency: task overlap observed in a normal CUDASTF execution.
@@ -65,6 +67,31 @@ Selected outputs are task count, edge count, critical-path length, and the
 average, peak, p50, p95, and CV of ASAP level width. Level percentiles weight
 each integer ASAP level equally. Combined topology treats independent DAGs as
 a disjoint union beginning at modeled time zero.
+
+## Kernel Occupancy Capacity
+
+CUDA calculates `max_active_blocks_per_sm` for each compiled DAG kernel and
+assigned device using the configured threads per block and dynamic shared
+memory. The occupancy API incorporates register, shared-memory, thread, warp,
+and block residency limits. With device SM count `S_d`, active blocks per SM
+`A_d`, and task grid size `B`:
+
+```text
+resident_blocks_d            = S_d * A_d
+occupancy_saturation_tasks_d = ceil(resident_blocks_d / B)
+```
+
+Only devices assigned at least one task from that DAG are included. Multi-GPU
+combined capacity sums per-device resident blocks and sums the per-device task
+counts after rounding because one task grid cannot span devices. Different
+DAG kernels are reported separately and are not combined into a mixed-kernel
+capacity.
+
+The public path is `kernel_capacity`. It is available independently of task
+profiling and serialization. `occupancy_saturation_tasks` is the number of
+runnable task kernels needed to supply enough blocks to fill theoretical block
+residency. It is neither maximum task concurrency nor performance saturation,
+and actual task-envelope concurrency may be above or below it.
 
 ## Potential DAG Parallelism
 
@@ -150,15 +177,17 @@ timelines are never merged.
 
 ## Storage And Integrity
 
-Raw run JSON schema 3 retains configuration, environment provenance, expanded
+Raw run JSON schema 4 retains configuration, environment provenance, expanded
 DAGs, placement, measured performance samples, and all public task-profiler
-fields. Analysis JSON schema 4 contains topology and reproducible derived
-metrics.
+fields. Analysis JSON schema 5 contains topology, kernel capacity, and
+reproducible derived metrics.
 
 Offline analysis recomputes topology, workload, execution, environment, and
-raw-data hashes before deriving metrics. Per-task normal durations remain in
-raw JSON and are not duplicated in concurrency analysis. GPU UUID remains raw
-provenance but is excluded from same-model environment compatibility.
+raw-data hashes before deriving metrics. Device SM count participates in the
+environment hash, while compiled kernel resource and occupancy fields
+participate in the raw-data hash. Per-task normal durations remain in raw JSON
+and are not duplicated in concurrency analysis. GPU UUID remains raw provenance
+but is excluded from same-model environment compatibility.
 
 ## Deferred Analysis
 

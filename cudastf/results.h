@@ -21,6 +21,7 @@ struct CudaDeviceInfo {
   int driver_version = 0;
   int compute_capability_major = 0;
   int compute_capability_minor = 0;
+  int sm_count = 0;
   int max_threads_per_block = 0;
   int max_grid_size_x = 0;
   std::size_t legacy_shared_memory_per_block = 0;
@@ -58,6 +59,7 @@ void print_report(const RunConfig &run_config,
                       &task_iteration_counts,
                   const std::vector<GpuKernelConfig> &gpu_kernel_configs,
                   const KernelResourcesByDag &kernel_resources,
+                  const KernelCapacityMetrics &kernel_capacity,
                   const TopologyMetrics &topology_metrics,
                   const DerivedMetrics &derived_metrics,
                   const std::string &workload_config_hash,
@@ -81,6 +83,7 @@ void write_analysis_json(
     const std::string &path,
     const std::vector<ExpandedDag> &expanded_dags,
     const TopologyMetrics &topology_metrics,
+    const KernelCapacityMetrics &kernel_capacity,
     const DerivedMetrics &derived_metrics,
     const std::string &workload_config_hash,
     const std::string &execution_config_hash,

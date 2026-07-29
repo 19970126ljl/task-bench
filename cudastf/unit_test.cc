@@ -1311,13 +1311,75 @@ void test_derived_parallelism_metrics()
         "normal profiled execution produced DAG parallelism metrics");
   }
 
-  const std::string first_hash =
-      compute_raw_data_hash("w", "e", "environment", samples);
+  KernelResourcesByDag kernel_resources{{{0, 32, 0, 4}}};
+  const std::string first_hash = compute_raw_data_hash(
+      "w", "e", "environment", kernel_resources, samples);
   std::vector<SampleResult> changed = samples;
   changed[0].task_profile->tasks[0].end_ns++;
   if (first_hash ==
-      compute_raw_data_hash("w", "e", "environment", changed)) {
+      compute_raw_data_hash(
+          "w", "e", "environment", kernel_resources, changed)) {
     throw std::runtime_error("raw data hash ignored task timing");
+  }
+  kernel_resources[0][0].max_active_blocks_per_sm++;
+  if (first_hash == compute_raw_data_hash(
+          "w", "e", "environment", kernel_resources, samples)) {
+    throw std::runtime_error("raw data hash ignored kernel resources");
+  }
+}
+
+void test_kernel_capacity_metrics()
+{
+  ExpandedDag dag = make_layered_dag({2});
+  dag.task_graph.max_width = 2;
+  RunConfig config;
+  config.task_placement.devices = {0, 1};
+  config.task_placement.policy = TaskPlacementPolicy::cyclic;
+  GpuKernelConfig kernel;
+  kernel.launch.blocks_per_task = 32;
+  CudaDeviceInfo first;
+  first.device_id = 0;
+  first.sm_count = 10;
+  CudaDeviceInfo second;
+  second.device_id = 1;
+  second.sm_count = 12;
+  first.name = second.name = "fixture-gpu";
+  first.compute_capability_major = second.compute_capability_major = 10;
+  first.compute_capability_minor = second.compute_capability_minor = 0;
+  const std::string environment_hash =
+      compute_environment_hash({first, second});
+  second.sm_count++;
+  if (environment_hash == compute_environment_hash({first, second})) {
+    throw std::runtime_error("environment hash ignored SM count");
+  }
+  second.sm_count--;
+  const KernelResourcesByDag resources{
+      {{0, 32, 0, 4}, {1, 32, 0, 5}}};
+  const KernelCapacityMetrics capacity = compute_kernel_capacity(
+      config, {dag}, {kernel}, {first, second}, resources);
+  const DagKernelCapacity &result = capacity.dags.front();
+  if (result.devices.size() != 2 ||
+      result.devices[0].resident_blocks != 40 ||
+      result.devices[0].occupancy_saturation_tasks != 2 ||
+      result.devices[1].resident_blocks != 60 ||
+      result.devices[1].occupancy_saturation_tasks != 2 ||
+      result.combined.device_count != 2 ||
+      result.combined.resident_blocks != 100 ||
+      result.combined.occupancy_saturation_tasks != 4) {
+    throw std::runtime_error("multi-GPU kernel capacity mismatch");
+  }
+
+  dag.task_graph.max_width = 1;
+  dag.tasks.resize(1);
+  const KernelCapacityMetrics single_capacity = compute_kernel_capacity(
+      config, {dag}, {kernel}, {first, second}, resources);
+  const DagKernelCapacity &single_device = single_capacity.dags.front();
+  if (single_device.devices.size() != 1 ||
+      single_device.devices.front().device_id != 0 ||
+      single_device.combined.device_count != 1 ||
+      single_device.combined.occupancy_saturation_tasks != 2) {
+    throw std::runtime_error(
+        "kernel capacity included an unassigned device");
   }
 }
 
@@ -1469,6 +1531,7 @@ int main()
     test_task_placement();
     test_execution_identity();
     test_task_iteration_counts();
+    test_kernel_capacity_metrics();
     test_topology_metrics();
     test_statistics();
     test_task_profile_association();

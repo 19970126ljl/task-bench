@@ -294,6 +294,9 @@ assert_equivalent(normal_analysis["derived_metrics"],
                   normal_offline["derived_metrics"])
 assert_equivalent(online["topology"], offline["topology"])
 assert_equivalent(normal_analysis["topology"], normal_offline["topology"])
+assert_equivalent(online["kernel_capacity"], offline["kernel_capacity"])
+assert_equivalent(normal_analysis["kernel_capacity"],
+                  normal_offline["kernel_capacity"])
 assert online["source"]["raw_data_hash"] == offline["source"]["raw_data_hash"]
 assert online["source"]["environment_hash"] == \
        offline["source"]["environment_hash"]
@@ -391,7 +394,7 @@ fi
 
 jq -e '
   .format == "cudastf-task-bench-run" and
-  .schema_version == 3 and
+  .schema_version == 4 and
   .backend == "cudastf" and
   (.workload_config_hash | test("^[0-9a-f]{16}$")) and
   (.execution_config_hash | test("^[0-9a-f]{16}$")) and
@@ -416,6 +419,7 @@ jq -e '
   (.devices | length) == 1 and
   .devices[0].device_id == 0 and
   (.devices[0].compute_capability | test("^[0-9]+\\.[0-9]+$")) and
+  .devices[0].sm_count > 0 and
   .devices[0].legacy_shared_memory_per_block_bytes > 0 and
   .devices[0].optin_shared_memory_per_block_bytes >=
     .devices[0].legacy_shared_memory_per_block_bytes and
@@ -466,7 +470,7 @@ jq -e '
 
 jq -e '
   .format == "cudastf-task-bench-analysis" and
-  .schema_version == 4 and
+  .schema_version == 5 and
   .backend == "cudastf" and
   (.source.task_bench_revision | length) > 0 and
   (.source.task_bench_worktree_dirty | type) == "boolean" and
@@ -488,6 +492,21 @@ jq -e '
   .topology.dags[0].parallelism.p95 == 8 and
   .topology.dags[0].parallelism.cv == 0 and
   .topology.combined == (.topology.dags[0] | del(.dag_index)) and
+  (.kernel_capacity.dags | length) == 1 and
+  .kernel_capacity.dags[0].dag_index == 0 and
+  (.kernel_capacity.dags[0].devices | length) == 1 and
+  .kernel_capacity.dags[0].devices[0].device_id == 0 and
+  .kernel_capacity.dags[0].devices[0].sm_count > 0 and
+  .kernel_capacity.dags[0].devices[0].resident_blocks ==
+    (.kernel_capacity.dags[0].devices[0].sm_count *
+     .kernel_capacity.dags[0].devices[0].max_active_blocks_per_sm) and
+  .kernel_capacity.dags[0].devices[0].occupancy_saturation_tasks ==
+    ((.kernel_capacity.dags[0].devices[0].resident_blocks / 32) | ceil) and
+  .kernel_capacity.dags[0].combined.device_count == 1 and
+  .kernel_capacity.dags[0].combined.resident_blocks ==
+    .kernel_capacity.dags[0].devices[0].resident_blocks and
+  .kernel_capacity.dags[0].combined.occupancy_saturation_tasks ==
+    .kernel_capacity.dags[0].devices[0].occupancy_saturation_tasks and
   .derived_metrics.parallelism.status == "unavailable" and
   .derived_metrics.concurrency.status == "unavailable"
 ' "$test_tmp/analysis-a.json" >/dev/null
@@ -535,6 +554,8 @@ grep -F \
   "$test_tmp/json-imbalance.out" >/dev/null
 grep -F "Iteration imbalance: 1" \
   "$test_tmp/json-imbalance.out" >/dev/null
+grep -F "Occupancy saturation:" \
+  "$test_tmp/json-a.out" >/dev/null
 grep -F "Kernel workload iterations: 4/task, total 48" \
   "$test_tmp/json-memory.out" >/dev/null
 
@@ -757,6 +778,17 @@ assert concurrency["status"] == "available"
 assert concurrency["samples"][0]["combined"]["task_gpu_span"]["peak"] > 1
 assert concurrency["samples"][0]["combined"]["end_to_end_span"]["status"] \
        == "available"
+capacity = online["kernel_capacity"]["dags"][0]
+assert capacity["combined"]["device_count"] == 2
+assert [device["device_id"] for device in capacity["devices"]] == [0, 1]
+blocks_per_task = run["dags"][0]["kernel"]["launch"]["blocks_per_task"]
+assert capacity["combined"]["resident_blocks"] == sum(
+    device["resident_blocks"] for device in capacity["devices"]
+)
+assert capacity["combined"]["occupancy_saturation_tasks"] == sum(
+    (device["resident_blocks"] + blocks_per_task - 1) // blocks_per_task
+    for device in capacity["devices"]
+)
 
 def equivalent(left_value, right_value):
     if isinstance(left_value, dict):

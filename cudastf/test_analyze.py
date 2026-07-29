@@ -112,7 +112,20 @@ def make_run():
                 "threads_per_block": 64,
                 "dynamic_shared_memory_bytes": 0,
             },
-            "resources": [],
+            "resources": [
+                {
+                    "device_id": 0,
+                    "registers_per_thread": 32,
+                    "static_shared_memory_bytes": 0,
+                    "max_active_blocks_per_sm": 4,
+                },
+                {
+                    "device_id": 1,
+                    "registers_per_thread": 32,
+                    "static_shared_memory_bytes": 0,
+                    "max_active_blocks_per_sm": 5,
+                },
+            ],
         },
         "tasks": len(tasks),
         "dependency_edges": 1,
@@ -121,7 +134,7 @@ def make_run():
     dag["topology_hash"] = analyze.compute_topology_hash(dag)
     run = {
         "format": "cudastf-task-bench-run",
-        "schema_version": 3,
+        "schema_version": 4,
         "backend": "cudastf",
         "task_bench_revision": "fixture",
         "task_bench_worktree_dirty": False,
@@ -140,12 +153,14 @@ def make_run():
                 "name": "fixture-gpu",
                 "uuid": "GPU-fixture-0",
                 "compute_capability": "10.0",
+                "sm_count": 10,
             },
             {
                 "device_id": 1,
                 "name": "fixture-gpu",
                 "uuid": "GPU-fixture-1",
                 "compute_capability": "10.0",
+                "sm_count": 12,
             },
         ],
         "run_config": {
@@ -222,8 +237,25 @@ def make_normal_run():
 class AnalyzeTest(unittest.TestCase):
     def test_parallelism_and_topology(self):
         result = analyze.analyze(make_run())
-        self.assertEqual(result["schema_version"], 4)
+        self.assertEqual(result["schema_version"], 5)
         self.assertEqual(result["topology"]["dags"][0]["critical_path_length"], 2)
+        capacity = result["kernel_capacity"]["dags"][0]
+        self.assertEqual(
+            [device["resident_blocks"] for device in capacity["devices"]],
+            [40, 60],
+        )
+        self.assertEqual(
+            [
+                device["occupancy_saturation_tasks"]
+                for device in capacity["devices"]
+            ],
+            [20, 30],
+        )
+        self.assertEqual(capacity["combined"]["device_count"], 2)
+        self.assertEqual(capacity["combined"]["resident_blocks"], 100)
+        self.assertEqual(
+            capacity["combined"]["occupancy_saturation_tasks"], 50
+        )
         parallelism_analysis = result["derived_metrics"]["parallelism"]
         self.assertEqual(parallelism_analysis["status"], "available")
         self.assertEqual(
@@ -334,6 +366,8 @@ class AnalyzeTest(unittest.TestCase):
                 "type", "debug"), "environment"),
             ("gpu model", lambda run: run["devices"][0].__setitem__(
                 "name", "different-gpu"), "environment"),
+            ("sm count", lambda run: run["devices"][0].__setitem__(
+                "sm_count", 20), "environment"),
         ]
         for name, mutate, expected in mutations:
             with self.subTest(name=name):
@@ -341,6 +375,14 @@ class AnalyzeTest(unittest.TestCase):
                 mutate(changed)
                 with self.assertRaisesRegex(ValueError, expected):
                     analyze.analyze(changed)
+
+    def test_raw_hash_rejects_changed_kernel_resources(self):
+        changed = make_run()
+        changed["dags"][0]["kernel"]["resources"][0][
+            "max_active_blocks_per_sm"
+        ] += 1
+        with self.assertRaisesRegex(ValueError, "raw data hash mismatch"):
+            analyze.analyze(changed)
 
     def test_dag_order_is_bound_to_workload_hash(self):
         run = make_run()

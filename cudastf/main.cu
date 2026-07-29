@@ -126,6 +126,7 @@ CudaDeviceInfo inspect_cuda_device(int device_id)
   result.uuid = format_uuid(properties.uuid);
   result.compute_capability_major = properties.major;
   result.compute_capability_minor = properties.minor;
+  result.sm_count = properties.multiProcessorCount;
   result.max_threads_per_block = properties.maxThreadsPerBlock;
   result.max_grid_size_x = properties.maxGridSize[0];
   result.legacy_shared_memory_per_block = properties.sharedMemPerBlock;
@@ -669,6 +670,10 @@ int main(int argc, char **argv)
     const KernelResourcesByDag kernel_resources =
         validate_gpu_kernel_configs(
             expanded_dags, arguments.gpu_kernel_configs, devices);
+    const KernelCapacityMetrics kernel_capacity =
+        compute_kernel_capacity(
+            arguments.run, expanded_dags,
+            arguments.gpu_kernel_configs, devices, kernel_resources);
     validate_device_memory(
         expanded_dags, arguments.run.task_placement);
     const std::string workload_config_hash =
@@ -711,11 +716,11 @@ int main(int argc, char **argv)
         derive_metrics(arguments.run, expanded_dags, samples);
     const std::string raw_data_hash = compute_raw_data_hash(
         workload_config_hash, execution_config_hash,
-        environment_hash, samples);
+        environment_hash, kernel_resources, samples);
 
     print_report(arguments.run, devices, expanded_dags,
                  task_iteration_counts, arguments.gpu_kernel_configs,
-                 kernel_resources, topology_metrics,
+                 kernel_resources, kernel_capacity, topology_metrics,
                  derived_metrics, workload_config_hash,
                  execution_config_hash, environment_hash, samples);
     if (!arguments.output.run_json_path.empty()) {
@@ -730,7 +735,7 @@ int main(int argc, char **argv)
     if (!arguments.output.analysis_json_path.empty()) {
       write_analysis_json(
           arguments.output.analysis_json_path, expanded_dags,
-          topology_metrics, derived_metrics,
+          topology_metrics, kernel_capacity, derived_metrics,
           workload_config_hash, execution_config_hash,
           environment_hash, raw_data_hash);
     }

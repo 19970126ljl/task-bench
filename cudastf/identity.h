@@ -6,6 +6,7 @@
 
 #include "arguments.h"
 #include "expanded_dag.h"
+#include "workload.h"
 
 struct SampleResult;
 struct CudaDeviceInfo;
@@ -29,6 +30,7 @@ std::string compute_raw_data_hash(
     const std::string &workload_config_hash,
     const std::string &execution_config_hash,
     const std::string &environment_hash,
+    const KernelResourcesByDag &kernel_resources,
     const std::vector<SampleResult> &samples);
 
 #endif

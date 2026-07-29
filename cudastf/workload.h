@@ -9,6 +9,8 @@
 #include "core.h"
 #include "expanded_dag.h"
 
+struct CudaDeviceInfo;
+
 enum class GpuWorkload {
   empty,
   busy_wait,
@@ -63,5 +65,36 @@ struct GpuKernelResources {
 
 using KernelResourcesByDag =
     std::vector<std::vector<GpuKernelResources>>;
+
+struct DeviceKernelCapacity {
+  int device_id = 0;
+  int sm_count = 0;
+  int max_active_blocks_per_sm = 0;
+  std::uint64_t resident_blocks = 0;
+  std::uint64_t occupancy_saturation_tasks = 0;
+};
+
+struct CombinedKernelCapacity {
+  std::size_t device_count = 0;
+  std::uint64_t resident_blocks = 0;
+  std::uint64_t occupancy_saturation_tasks = 0;
+};
+
+struct DagKernelCapacity {
+  std::int64_t dag_index = 0;
+  std::vector<DeviceKernelCapacity> devices;
+  CombinedKernelCapacity combined;
+};
+
+struct KernelCapacityMetrics {
+  std::vector<DagKernelCapacity> dags;
+};
+
+KernelCapacityMetrics compute_kernel_capacity(
+    const RunConfig &run_config,
+    const std::vector<ExpandedDag> &expanded_dags,
+    const std::vector<GpuKernelConfig> &gpu_kernel_configs,
+    const std::vector<CudaDeviceInfo> &devices,
+    const KernelResourcesByDag &kernel_resources);
 
 #endif
